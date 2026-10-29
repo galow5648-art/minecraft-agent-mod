@@ -24,6 +24,11 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.core.Direction;
@@ -103,6 +108,16 @@ public class AgentMod implements ClientModInitializer {
             server.createContext("/look_at", ex -> respondFromGame(ex, AgentMod::lookAt));
             server.createContext("/inventory", ex -> respondFromGame(ex, AgentMod::inventory));
             server.createContext("/job", ex -> send(ex, 200, jobJson()));
+            server.createContext("/entities", ex -> {
+                int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
+                respondFromGame(ex, () -> entities(r));
+            });
+            server.createContext("/craft", ex -> {
+                String b = read(ex);
+                String item = field(b, "item");
+                int times = clamp((int) num(b, "times"), 1, 64);
+                respondFromGame(ex, () -> craft(item, times));
+            });
             server.createContext("/break", ex -> {
                 String b = read(ex);
                 int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
@@ -183,8 +198,67 @@ public class AgentMod implements ClientModInitializer {
                 }
             }
         }
-        sb.append("],\"truncated\":false}");
+        sb.append("],\"truncated\":false,\"items\":[");
+        AABB box = new AABB(base).inflate(r + 0.5);
+        boolean firstItem = true;
+        for (ItemEntity ie : level.getEntitiesOfClass(ItemEntity.class, box)) {
+            ItemStack st = ie.getItem();
+            if (!firstItem) sb.append(',');
+            firstItem = false;
+            sb.append("{\"x\":").append(round(ie.getX()))
+              .append(",\"y\":").append(round(ie.getY()))
+              .append(",\"z\":").append(round(ie.getZ()))
+              .append(",\"item\":\"").append(escape(String.valueOf(BuiltInRegistries.ITEM.getKey(st.getItem()))))
+              .append("\",\"count\":").append(st.getCount()).append('}');
+        }
+        sb.append("]}");
         return sb.toString();
+    }
+
+    private static String entities(int r) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            return "{\"inWorld\":false}";
+        }
+        AABB box = p.getBoundingBox().inflate(r);
+        StringBuilder sb = new StringBuilder("{\"hostile\":[");
+        boolean first = true;
+        for (Monster m : mc.level.getEntitiesOfClass(Monster.class, box)) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{\"type\":\"").append(escape(String.valueOf(BuiltInRegistries.ENTITY_TYPE.getKey(m.getType()))))
+              .append("\",\"x\":").append(round(m.getX()))
+              .append(",\"y\":").append(round(m.getY()))
+              .append(",\"z\":").append(round(m.getZ()))
+              .append(",\"health\":").append(round(m.getHealth())).append('}');
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    /** Крафт по рецепту из книги рецептов игры. Ингредиенты должны быть в инвентаре. */
+    private static String craft(String itemId, int times) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            return "{\"ok\":false,\"error\":\"нет игрока в мире\"}";
+        }
+        var recipeHolder = (var h) -> h;
+        for (var holder : mc.level.getRecipeManager().getRecipes()) {
+            if (!(holder.value() instanceof CraftingRecipe)) continue;
+            ItemStack result = holder.value().getResultItem(mc.level.registryAccess());
+            if (!String.valueOf(BuiltInRegistries.ITEM.getKey(result.getItem())).equals(itemId)) continue;
+            int menuId = p.containerMenu.containerId;
+            int crafted = 0;
+            for (int i = 0; i < times; i++) {
+                mc.gameMode.handlePlaceRecipe(menuId, holder, false);
+                mc.gameMode.handleInventoryMouseClick(menuId, 0, 0, ClickType.QUICK_MOVE, p);
+                crafted++;
+            }
+            return "{\"ok\":true,\"crafted\":" + crafted + ",\"item\":\"" + escape(itemId) + "\"}";
+        }
+        return "{\"ok\":false,\"error\":\"рецепт не найден или не в книге рецептов: " + escape(itemId) + "\"}";
     }
 
     private static String lookAt() {

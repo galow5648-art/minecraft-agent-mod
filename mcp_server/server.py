@@ -14,6 +14,21 @@ KEY_ACTIONS = ["forward", "back", "left", "right", "jump", "sneak", "sprint", "a
 
 TOOLS = [
     {
+        "name": "minecraft_situation",
+        "description": "Сводка ситуации: здоровье, голод, инвентарь (брёвна, доски, палки, камень, земля, инструменты), мобы рядом, предметы на земле, ближайшее бревно.",
+        "inputSchema": {"type": "object", "properties": {"radius": {"type": "integer", "minimum": 2, "maximum": 12}}},
+    },
+    {
+        "name": "minecraft_entities",
+        "description": "Враждебные мобы рядом: тип, координаты, здоровье.",
+        "inputSchema": {"type": "object", "properties": {"r": {"type": "integer", "minimum": 1, "maximum": 48}}},
+    },
+    {
+        "name": "minecraft_craft",
+        "description": "Скрафтить предмет по рецепту из книги рецептов (например minecraft:oak_planks, minecraft:stick, minecraft:crafting_table, minecraft:wooden_pickaxe). Ингредиенты должны быть в инвентаре.",
+        "inputSchema": {"type": "object", "properties": {"item": {"type": "string"}, "times": {"type": "integer", "minimum": 1, "maximum": 64}}, "required": ["item"]},
+    },
+    {
         "name": "minecraft_goto",
         "description": "Идти к точке (x, z) по прямой с прыжками через ступеньки. Ждёт окончания. Возвращает статус.",
         "inputSchema": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}, "required": ["x", "y", "z"]},
@@ -136,7 +151,44 @@ def chop_tree(radius=6, max_logs=10):
     return json.dumps({"chopped": sum(1 for d in done if d["result"].get("status") == "done"), "details": done}, ensure_ascii=False)
 
 
+def situation(radius=8):
+    import math
+    state = json.loads(call_api("GET", "/state"))
+    inv = json.loads(call_api("GET", "/inventory"))
+    near = json.loads(call_api("GET", f"/nearby?r={radius}"))
+    mobs = json.loads(call_api("GET", f"/entities?r={radius * 2}"))
+    counts = {}
+    for slot in inv.get("slots", []):
+        counts[slot["item"]] = counts.get(slot["item"], 0) + slot["count"]
+    logs = [b for b in near.get("blocks", []) if b["block"].endswith("_log")]
+    nearest_log = None
+    if logs and state.get("inWorld"):
+        best = min(logs, key=lambda b: math.dist((b["x"], b["y"], b["z"]), (state["x"], state["y"], state["z"])))
+        nearest_log = {**best, "distance": round(math.dist((best["x"], best["y"], best["z"]), (state["x"], state["y"], state["z"])), 2)}
+    warnings = []
+    if state.get("health", 20) <= 8:
+        warnings.append("мало здоровья")
+    if state.get("food", 20) <= 6:
+        warnings.append("голод")
+    if mobs.get("hostile"):
+        warnings.append(f"враждебные мобы рядом: {len(mobs['hostile'])}")
+    return json.dumps({
+        "state": state,
+        "inventory": counts,
+        "nearest_log": nearest_log,
+        "items_on_ground": near.get("items", []),
+        "hostile_mobs": mobs.get("hostile", []),
+        "warnings": warnings,
+    }, ensure_ascii=False)
+
+
 def run_tool(name, args):
+    if name == "minecraft_situation":
+        return situation(int(args.get("radius", 8)))
+    if name == "minecraft_entities":
+        return call_api("GET", f"/entities?r={int(args.get('r', 16))}")
+    if name == "minecraft_craft":
+        return call_api("POST", "/craft", {"item": args["item"], "times": int(args.get("times", 1))})
     if name == "minecraft_goto":
         call_api("POST", "/goto", {"x": float(args["x"]), "y": float(args.get("y", 0)), "z": float(args["z"])})
         return json.dumps(wait_job(), ensure_ascii=False)
