@@ -111,6 +111,7 @@ public class AgentMod implements ClientModInitializer {
             server.createContext("/inventory", ex -> respondFromGame(ex, AgentMod::inventory));
             server.createContext("/job", ex -> send(ex, 200, jobJson()));
             server.createContext("/debug_api", ex -> send(ex, 200, dumpApi()));
+            server.createContext("/debug_recipes", ex -> send(ex, 200, dumpRecipes()));
             server.createContext("/entities", ex -> {
                 int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
                 respondFromGame(ex, () -> entities(r));
@@ -579,6 +580,54 @@ public class AgentMod implements ClientModInitializer {
                 }
                 for (java.lang.reflect.Method m : c.getMethods()) {
                     if (!all && !keep.matcher(m.getName()).find() && !keep.matcher(c.getSimpleName()).find()) continue;
+                    sb.append("  ").append(m.getReturnType().getName()).append(' ').append(m.getName()).append('(');
+                    Class<?>[] ps = m.getParameterTypes();
+                    for (int i = 0; i < ps.length; i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(ps[i].getName());
+                    }
+                    sb.append(")\n");
+                }
+            } catch (ClassNotFoundException | LinkageError e) {
+                sb.append("## MISSING ").append(name).append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Служебный дамп: клиентский доступ к рецептам и классы отображения результата. */
+    private static String dumpRecipes() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            Object acc = mc.getConnection().recipes();
+            sb.append("## client RecipeAccess impl: ").append(acc.getClass().getName()).append('\n');
+            for (Class<?> c = acc.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                    sb.append("  ").append(c.getSimpleName()).append(": ").append(m.getReturnType().getName())
+                      .append(' ').append(m.getName()).append('(').append(m.getParameterCount()).append(")\n");
+                }
+            }
+        } catch (RuntimeException e) {
+            sb.append("## client RecipeAccess error: ").append(e).append('\n');
+        }
+        String[] classes = {
+            "net.minecraft.world.item.crafting.display.SlotDisplay",
+            "net.minecraft.world.item.crafting.display.RecipeDisplayId",
+            "net.minecraft.world.item.crafting.display.RecipeDisplay$Type",
+            "net.minecraft.world.item.crafting.CraftingInput",
+            "net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay",
+            "net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay",
+            "net.minecraft.world.item.crafting.display.SlotDisplay$ItemStackSlotDisplay",
+            "net.minecraft.world.item.crafting.display.SlotDisplay$ItemSlotDisplay",
+            "net.minecraft.world.item.crafting.RecipeHolder"
+        };
+        for (String name : classes) {
+            try {
+                Class<?> c = Class.forName(name);
+                sb.append("## ").append(name).append('\n');
+                for (java.lang.reflect.Method m : c.getMethods()) {
+                    if (m.getDeclaringClass() == Object.class) continue;
                     sb.append("  ").append(m.getReturnType().getName()).append(' ').append(m.getName()).append('(');
                     Class<?>[] ps = m.getParameterTypes();
                     for (int i = 0; i < ps.length; i++) {
