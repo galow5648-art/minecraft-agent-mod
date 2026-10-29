@@ -113,6 +113,7 @@ public class AgentMod implements ClientModInitializer {
             server.createContext("/debug_api", ex -> send(ex, 200, dumpApi()));
             server.createContext("/debug_recipes", ex -> send(ex, 200, dumpRecipes()));
             server.createContext("/debug_sync", ex -> respondFromGame(ex, AgentMod::dumpSync));
+            server.createContext("/debug_book", ex -> respondFromGame(ex, AgentMod::dumpBook));
             server.createContext("/entities", ex -> {
                 int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
                 respondFromGame(ex, () -> entities(r));
@@ -711,6 +712,34 @@ public class AgentMod implements ClientModInitializer {
             }
             sb.append(")\n");
         }
+    }
+
+    /** Служебный дамп: записи книги рецептов и коллекции (для автокрафта по RecipeDisplayId). */
+    private static String dumpBook() {
+        StringBuilder sb = new StringBuilder();
+        String[] names = {
+            "net.minecraft.world.item.crafting.display.RecipeDisplayEntry",
+            "net.minecraft.client.RecipeCollection",
+            "net.minecraft.client.gui.screens.recipebook.RecipeCollection",
+            "net.minecraft.world.item.crafting.display.RecipeDisplayId",
+            "net.minecraft.world.item.crafting.display.RecipeDisplay"
+        };
+        for (String name : names) {
+            try {
+                sb.append("## ").append(name).append('\n');
+                dumpClass(sb, Class.forName(name));
+            } catch (ClassNotFoundException | LinkageError e) {
+                sb.append("## MISSING ").append(name).append('\n');
+            }
+        }
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            Object book = mc.player == null ? null : mc.getConnection().getRecipeBook();
+            sb.append("## book obj: ").append(book == null ? "null" : book.getClass().getName()).append('\n');
+        } catch (RuntimeException e) {
+            sb.append("## book error: ").append(e).append('\n');
+        }
+        return sb.toString();
     }
 
     private static String blockId(BlockState st) {
