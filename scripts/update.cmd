@@ -24,8 +24,7 @@ echo Watch mode: checking GitHub every %WATCH_MIN% minutes. Close this window to
 :watch_next
 call :run_once_quiet
 echo Next check in %WATCH_MIN% minutes...
-timeout /t %WATCH_MIN%0 /nobreak >nul 2>&1
-timeout /t 0 >nul 2>&1
+timeout /t 900 /nobreak >nul 2>&1
 goto :watch_next
 
 :run_once
