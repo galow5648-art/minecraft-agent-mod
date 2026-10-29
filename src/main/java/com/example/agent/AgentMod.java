@@ -621,16 +621,30 @@ public class AgentMod implements ClientModInitializer {
     // ---------------------------------------------------------------- инструмент и меню
 
     private static int bestToolSlot(LocalPlayer p, BlockState st) {
-        int best = p.getInventory().getSelectedSlot();
-        float bestSpeed = p.getInventory().getItem(best).getDestroySpeed(st);
-        for (int i = 0; i < 9; i++) {
-            float sp = p.getInventory().getItem(i).getDestroySpeed(st);
-            if (sp > bestSpeed + 0.01f) {
+        // Почти сломанные инструменты пропускаем; при равной скорости предпочитаем предмет без прочности
+        // (рука/блок), чтобы не тратить меч или кирку на блок, который они не ускоряют.
+        int selected = p.getInventory().getSelectedSlot();
+        int best = -1;
+        float bestSpeed = 0f;
+        boolean bestDamageable = true;
+        for (int k = 0; k < 9; k++) {
+            int i = (selected + k) % 9;
+            ItemStack s = p.getInventory().getItem(i);
+            boolean damageable = !s.isEmpty() && s.isDamageableItem();
+            if (damageable) {
+                int left = s.getMaxDamage() - s.getDamageValue();
+                if (left <= Math.max(8, s.getMaxDamage() / 10)) continue;
+            }
+            float sp = s.getDestroySpeed(st);
+            boolean better = best < 0 || sp > bestSpeed + 0.01f
+                    || (Math.abs(sp - bestSpeed) <= 0.01f && bestDamageable && !damageable);
+            if (better) {
                 best = i;
                 bestSpeed = sp;
+                bestDamageable = damageable;
             }
         }
-        return best;
+        return best < 0 ? selected : best;
     }
 
     private static String selectToolJson(int x, int y, int z) {

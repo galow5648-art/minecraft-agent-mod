@@ -395,7 +395,15 @@ def goto(x, y, z, stops=None, any_y=False):
         payload["any_y"] = True
     payload.update(ACTIVE["stops"])
     payload.update(stops or {})
-    return run_job("/goto", payload)
+    res = run_job("/goto", payload)
+    try:
+        if res.get("status") == "done" and "ближайшей" in str(res.get("info", "")):
+            res["reached"] = False
+            res["hint"] = ("дошли только до ближайшей доступной точки, не до цели; если цель выше/в шахте — "
+                           "используй minecraft_dig_to (копает лестницу вверх)")
+    except AttributeError:
+        pass
+    return res
 
 
 def goto_far(x, y, z, stops=None):
