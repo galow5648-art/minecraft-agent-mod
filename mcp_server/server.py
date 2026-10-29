@@ -261,9 +261,23 @@ STOP_PROPS = {
     "stop_health": {"type": "number", "description": "прервать задачу, если здоровье <= значения"},
     "stop_hostile": {"type": "number", "description": "прервать задачу, если враждебный моб ближе этого расстояния"},
 }
+LONG_OPS = ("minecraft_mine", "minecraft_dig_to", "minecraft_chop_tree")
 for _t in TOOLS:
     if _t["name"] in ("minecraft_goto", "minecraft_break", "minecraft_place", "minecraft_attack", "minecraft_use_item"):
         _t["inputSchema"]["properties"].update(STOP_PROPS)
+    if _t["name"] in LONG_OPS:
+        # у долгих операций защита включена по умолчанию; значение 0 её отключает
+        _t["inputSchema"]["properties"].update({
+            "stop_health": {"type": "number", "description": "прервать, если здоровье <= значения (по умолчанию 8; 0 — выключить)"},
+            "stop_hostile": {"type": "number", "description": "прервать, если враждебный моб ближе этого расстояния (по умолчанию 5; 0 — выключить)"},
+            "max_seconds": {"type": "number", "description": "лимит времени операции, по умолчанию 120 (клиент обрывает вызовы дольше ~4 мин)"},
+        })
+        _t["description"] += " Перед стартом проверяет инструмент (почти сломанные не берёт), прерывается при низком здоровье, мобах рядом, жидкости и по лимиту времени; в ответе есть tool, tool_wear, stopped_by."
+    if _t["name"] == "minecraft_recipes":
+        _t["inputSchema"]["properties"].update({
+            "q": {"type": "string", "description": "подстрока в названии результата (например iron_helmet); без неё вернётся только первые max записей"},
+            "max": {"type": "integer", "minimum": 1, "maximum": 100},
+        })
     if _t["name"] == "minecraft_place":
         _t["inputSchema"]["properties"]["face"] = {"type": "string", "enum": ["up", "down", "north", "south", "east", "west"],
                                                    "description": "грань опорного блока, к которой ставим (по умолчанию up)"}
@@ -318,10 +332,58 @@ def stops_of(args):
     return out
 
 
+# Активные условия остановки длинной операции (mine/dig_to/chop_tree): подмешиваются во все goto/break,
+# которые эта операция вызывает внутри, и проверяются между шагами через guard().
+STOPPED = ("stopped", "interrupted")  # "interrupted" — статус мода при срабатывании stop_health/stop_hostile
+ACTIVE = {"stops": {}, "deadline": None}
+
+
+def set_active(stops, max_seconds):
+    ACTIVE["stops"] = dict(stops or {})
+    ACTIVE["deadline"] = (time.time() + float(max_seconds)) if max_seconds else None
+
+
+def clear_active():
+    ACTIVE["stops"] = {}
+    ACTIVE["deadline"] = None
+
+
+def guard():
+    """Причина, по которой длинную операцию пора прервать, или None."""
+    d = ACTIVE["deadline"]
+    if d and time.time() > d:
+        return "лимит времени вышел"
+    s = ACTIVE["stops"]
+    if s.get("stop_health"):
+        hp = api("GET", "/state").get("health")
+        if hp is not None and hp <= s["stop_health"]:
+            return f"здоровье {hp} <= {s['stop_health']}"
+    if s.get("stop_hostile"):
+        r = int(min(48, max(8, s["stop_hostile"] + 2)))
+        for e in api("GET", f"/entities_all?r={r}").get("entities", []):
+            if e.get("hostile") and e.get("distance", 999) <= s["stop_hostile"]:
+                return f"враждебный {e.get('type')} в {e.get('distance')} м"
+    return None
+
+
+def default_stops(args):
+    """Для долгих операций защита включена по умолчанию: здоровье <= 8 и враждебный моб ближе 5 м."""
+    args = args or {}
+    out = {}
+    hp = args.get("stop_health", 8)
+    hostile = args.get("stop_hostile", 5)
+    if hp:
+        out["stop_health"] = float(hp)
+    if hostile:
+        out["stop_hostile"] = float(hostile)
+    return out
+
+
 def goto(x, y, z, stops=None, any_y=False):
     payload = {"x": float(x), "y": float(y if y is not None else 0), "z": float(z)}
     if any_y or y is None:
         payload["any_y"] = True
+    payload.update(ACTIVE["stops"])
     payload.update(stops or {})
     return run_job("/goto", payload)
 
@@ -342,6 +404,7 @@ def goto_far(x, y, z, stops=None):
 
 def brk(x, y, z, stops=None):
     payload = {"x": int(x), "y": int(y), "z": int(z)}
+    payload.update(ACTIVE["stops"])
     payload.update(stops or {})
     return run_job("/break", payload)
 
@@ -454,11 +517,13 @@ def brk_clear(x, y, z, log=None, stops=None, depth=0):
 def break_with_retry(t, log):
     """Сломать блок t: подойти, при необходимости убрать загораживающий блок."""
     res = goto(t["x"], t["y"], t["z"])
+    if res.get("status") in STOPPED:
+        return res
     if res.get("status") != "done":
         return {"status": "failed", "error": "не дойти: " + str(res.get("error"))}
     for _ in range(4):
         res = brk_clear(t["x"], t["y"], t["z"], log)
-        if res.get("status") == "done":
+        if res.get("status") in ("done",) + STOPPED:
             return res
         err = res.get("error") or ""
         if "далеко" in err:
@@ -474,6 +539,9 @@ def dig_to(x, y, z, max_steps=60):
     """Туннель к точке: горизонтально по большей оси, вверх/вниз лесенкой."""
     notes = []
     for step in range(int(max_steps)):
+        reason = guard()
+        if reason:
+            return {"status": "stopped", "error": reason, "notes": notes}
         me = api("GET", "/state")
         cx, cy, cz = math.floor(me["x"]), math.floor(me["y"]), math.floor(me["z"])
         dx, dy, dz = x - cx, y - cy, z - cz
@@ -500,67 +568,180 @@ def dig_to(x, y, z, max_steps=60):
             return {"status": "stopped", "error": "рядом жидкость: " + ",".join(liquids) + ", остановился", "notes": notes}
         for (bx, by, bz) in to_break:
             res = brk_clear(bx, by, bz, notes)
+            if res.get("status") in STOPPED:
+                return {"status": "stopped", "error": res.get("error") or res.get("info"), "notes": notes}
             if res.get("status") != "done":
                 return {"status": "failed", "error": f"на шаге {step}: {res.get('error')}", "notes": notes}
         g = goto(nx, ny, nz)
+        if g.get("status") in STOPPED:
+            return {"status": "stopped", "error": g.get("error") or g.get("info"), "notes": notes}
         if g.get("status") != "done":
             return {"status": "failed", "error": f"не прошёл на ({nx},{ny},{nz}): {g.get('error')}", "notes": notes}
     return {"status": "partial", "error": "лимит шагов", "notes": notes}
 
 
-def mine(block, count=1, radius=24):
+def tool_kind_for(plain):
+    """Какой инструмент нужен для блока (по id или алиасу из resolve_block)."""
+    p = plain.lstrip("=")
+    if p.endswith("_log") or p.endswith("_wood") or "planks" in p or p in ("_log", "pumpkin", "melon"):
+        return "axe"
+    if p in ("dirt", "sand", "gravel", "clay", "grass_block", "soul_sand", "snow", "mud", "podzol", "mycelium"):
+        return "shovel"
+    return "pickaxe"
+
+
+def is_worn(s, margin=0.10):
+    """Инструмент почти сломан: осталось <= 10% прочности (минимум 8 единиц)."""
+    d, m = s.get("durability"), s.get("maxDurability")
+    return d is not None and bool(m) and d <= max(8, int(m * margin))
+
+
+def stash_worn_tools():
+    """Убрать из хотбара почти сломанные инструменты в свободный слот основного инвентаря."""
+    st = api("GET", "/status")
+    if st.get("menu") not in (None, "InventoryMenu"):
+        api("POST", "/close", {})
+    slots = api("GET", "/inventory").get("slots", [])
+    used = {s["slot"] for s in slots}
+    free = [i for i in range(9, 36) if i not in used]
+    moved = []
+    for s in slots:
+        if s["slot"] < 9 and is_worn(s) and free:
+            api("POST", "/click", {"slot": free.pop(0), "button": s["slot"], "type": "SWAP"})
+            moved.append(short(s["item"]))
+    return moved
+
+
+def prepare_tool(plain):
+    """Выбрать и положить в хотбар подходящий инструмент для блока.
+    Возвращает (имя_инструмента | None, ошибка | None). Ошибка только если без инструмента не обойтись (кирка)."""
+    kind = tool_kind_for(plain)
+    stash_worn_tools()
+    slots = api("GET", "/inventory").get("slots", [])
+    need = NEED_PICK.get(plain.lstrip("="), 0) if kind == "pickaxe" else 0
+    cands = []
+    worn_names = []
+    for s in slots:
+        n = short(s["item"])
+        if not n.endswith("_" + kind):
+            continue
+        tier = n[: -len(kind) - 1]
+        rank = TIER_RANK.get(tier, 0)
+        if is_worn(s):
+            worn_names.append(f"{n} {s.get('durability')}/{s.get('maxDurability')}")
+            continue
+        if rank >= need:
+            cands.append((rank, s.get("durability") or 0, s["item"]))
+    if not cands:
+        if kind == "pickaxe":
+            names = ["деревянная", "каменная", "железная", "алмазная"]
+            msg = f"нет пригодной кирки (нужна {names[min(need, 3)]} или лучше)"
+            if worn_names:
+                msg += "; почти сломаны: " + ", ".join(worn_names)
+            return None, msg
+        return None, None
+    # для дешёвых блоков берём самый слабый подходящий инструмент, чтобы беречь железный
+    cands.sort(key=lambda c: (c[0], -c[1]))
+    chosen = cands[0][2] if need <= 1 else cands[-1][2]
+    if ensure_hotbar(chosen) is None:
+        return None, f"не удалось положить {short(chosen)} в хотбар"
+    return short(chosen), None
+
+
+def tool_durabilities():
+    out = {}
+    for s in api("GET", "/inventory").get("slots", []):
+        if s.get("durability") is not None:
+            out.setdefault(short(s["item"]), []).append(s["durability"])
+    return out
+
+
+def wear_report(before, after):
+    """Сколько прочности потеряли инструменты (по именам)."""
+    rep = {}
+    for name, ds in before.items():
+        a = after.get(name, [])
+        diff = sum(ds) - sum(a) if len(a) == len(ds) else None
+        if diff:
+            rep[name] = diff
+    return rep
+
+
+def mine(block, count=1, radius=24, stops=None, max_seconds=120):
     q = resolve_block(block)
     plain = q.lstrip("=")
     log = []
-    counts = inv_counts()
-    need = NEED_PICK.get(plain)
-    if need is not None and best_pick_rank(counts) < need:
-        have = best_pick_rank(counts)
-        names = ["деревянная", "каменная", "железная", "алмазная"]
-        return json.dumps({"mined": 0, "error": f"нужна {names[need]} кирка или лучше "
-                           f"(сейчас {'нет кирки' if have < 0 else names[min(have, 3)]})"}, ensure_ascii=False)
+    started = time.time()
+    set_active(stops, max_seconds)
+    wear_before = tool_durabilities()
     mined = 0
     fails = 0
     skip = set()
-    for _ in range(count * 4 + 6):
-        if mined >= count or fails >= 4:
-            break
-        res = find(q, "block", radius, 12)
-        cands = [t for t in res.get("results", []) if (t["x"], t["y"], t["z"]) not in skip]
-        if not cands:
-            break
-        exposed = [t for t in cands if t["exposed"]]
-        target = (exposed or cands)[0]
-        skip_key = (target["x"], target["y"], target["z"])
-        if not target["exposed"]:
-            log.append(f"блок {target['id']} на {skip_key} закрыт, копаю туннель")
-            d = dig_to(target["x"], target["y"], target["z"], 40)
-            log.append(f"туннель: {d.get('status')} {d.get('error', '')}")
-            if d.get("status") not in ("done",):
+    stopped_by = None
+    error = None
+    tool = None
+    try:
+        for _ in range(count * 4 + 6):
+            if mined >= count or fails >= 4:
+                break
+            stopped_by = guard()
+            if stopped_by:
+                break
+            tool, terr = prepare_tool(q)
+            if terr:
+                error = terr
+                break
+            res = find(q, "block", radius, 12)
+            cands = [t for t in res.get("results", []) if (t["x"], t["y"], t["z"]) not in skip]
+            if not cands:
+                break
+            exposed = [t for t in cands if t["exposed"]]
+            target = (exposed or cands)[0]
+            skip_key = (target["x"], target["y"], target["z"])
+            if not target["exposed"]:
+                log.append(f"блок {target['id']} на {skip_key} закрыт, копаю туннель")
+                d = dig_to(target["x"], target["y"], target["z"], 40)
+                log.append(f"туннель: {d.get('status')} {d.get('error', '')}")
+                if d.get("status") in STOPPED:
+                    stopped_by = d.get("error") or d.get("info") or "остановлено"
+                    break
+                if d.get("status") not in ("done",):
+                    fails += 1
+                    skip.add(skip_key)
+                    continue
+            before = inv_counts()
+            r = break_with_retry(target, log)
+            if r.get("status") == "done":
+                mined += 1
+                collect(6)
+                after = inv_counts()
+                gained = {short(i): c - before.get(i, 0) for i, c in after.items() if c > before.get(i, 0)}
+                log.append(f"{target['id']} на {skip_key}: +{gained}")
+            elif r.get("status") in STOPPED:
+                stopped_by = r.get("error") or r.get("info") or "остановлено"
+                break
+            else:
                 fails += 1
                 skip.add(skip_key)
-                continue
-        before = inv_counts()
-        r = break_with_retry(target, log)
-        if r.get("status") == "done":
-            mined += 1
-            collect(6)
-            after = inv_counts()
-            gained = {short(i): c - before.get(i, 0) for i, c in after.items() if c > before.get(i, 0)}
-            log.append(f"{target['id']} на {skip_key}: +{gained}")
-        else:
-            fails += 1
-            skip.add(skip_key)
-            log.append(f"не вышло {target['id']} на {skip_key}: {r.get('error')}")
-    out = {"mined": mined, "wanted": count, "log": log[-12:]}
-    if mined < count:
+                log.append(f"не вышло {target['id']} на {skip_key}: {r.get('error')}")
+    finally:
+        clear_active()
+    out = {"mined": mined, "wanted": count, "tool": tool,
+           "tool_wear": wear_report(wear_before, tool_durabilities()),
+           "elapsed_s": round(time.time() - started, 1), "log": log[-12:]}
+    if error:
+        out["error"] = error
+    if stopped_by:
+        out["stopped_by"] = stopped_by
+        out["hint"] = "операция прервана защитой: оцени обстановку (minecraft_alerts, minecraft_entities_all) и реши, продолжать ли"
+    elif mined < count and not error:
         out["hint"] = ("блоков не нашлось в радиусе — иди дальше (minecraft_goto) и повтори" if fails == 0
                        else "были неудачи, см. log; можно вызвать снова или сменить место")
     return json.dumps(out, ensure_ascii=False)
 
 
-def chop_tree(radius=12, max_logs=6):
-    return mine("_log", max_logs, radius)
+def chop_tree(radius=12, max_logs=6, stops=None, max_seconds=120):
+    return mine("_log", max_logs, radius, stops, max_seconds)
 
 
 # ------------------------------------------------------------------ крафт, меню, печь
@@ -744,13 +925,60 @@ def ensure_hotbar(item):
     return sel
 
 
+INTERACTIVE_EXACT = {"crafting_table", "furnace", "blast_furnace", "smoker", "chest", "trapped_chest", "barrel",
+                     "ender_chest", "anvil", "chipped_anvil", "damaged_anvil", "enchanting_table", "loom",
+                     "cartography_table", "smithing_table", "fletching_table", "grindstone", "stonecutter",
+                     "lectern", "beacon", "hopper", "dropper", "dispenser", "brewing_stand", "note_block",
+                     "lever", "bell", "cauldron", "composter", "jukebox", "crafter", "respawn_anchor"}
+INTERACTIVE_SUFFIX = ("_door", "_trapdoor", "_button", "_fence_gate", "_bed", "shulker_box", "_sign")
+REPLACEABLE = {"leaf_litter", "short_grass", "tall_grass", "fern", "large_fern", "snow", "vine", "dead_bush",
+               "seagrass", "tall_seagrass", "glow_lichen", "moss_carpet", "pink_petals", "wildflowers"}
+FACE_DELTA = {"up": (0, 1, 0), "down": (0, -1, 0), "north": (0, 0, -1), "south": (0, 0, 1),
+              "east": (1, 0, 0), "west": (-1, 0, 0)}
+
+
+def is_interactive(block_id):
+    return block_id in INTERACTIVE_EXACT or block_id.endswith(INTERACTIVE_SUFFIX)
+
+
 def place(x, y, z, item=None, face="up", stops=None):
+    face = face or "up"
+    # зависшее меню (например, верстака после крафта) перехватывает клик и мешает ставить блоки
+    st = api("GET", "/status")
+    if st.get("menu") not in (None, "InventoryMenu"):
+        api("POST", "/close", {})
     if item:
         if ensure_hotbar(item) is None:
             return json.dumps({"status": "failed", "error": f"нет {norm_item(item)} в инвентаре"}, ensure_ascii=False)
-    payload = {"x": int(x), "y": int(y), "z": int(z), "face": face or "up"}
+    payload = {"x": int(x), "y": int(y), "z": int(z), "face": face}
     payload.update(stops or {})
-    return json.dumps(run_job("/place", payload), ensure_ascii=False)
+    # на верстак, печь, сундук, дверь и т.п. без приседания клик открывает блок, а не ставит
+    sneak = False
+    try:
+        sup = api("GET", f"/block_info?x={int(x)}&y={int(y)}&z={int(z)}").get("id", "")
+        sneak = is_interactive(sup)
+    except Exception:
+        pass
+    if sneak:
+        api("POST", "/key", {"action": "sneak", "down": True})
+    try:
+        res = run_job("/place", payload)
+        err = res.get("error") or ""
+        # на месте установки растёт заменяемая мелочь (сухие листья, трава): убираем и повторяем один раз
+        if err.startswith("место занято: "):
+            occupant = err.split(": ", 1)[1].strip()
+            if occupant in REPLACEABLE:
+                d = FACE_DELTA.get(face, (0, 1, 0))
+                brk(int(x) + d[0], int(y) + d[1], int(z) + d[2])
+                res = run_job("/place", payload)
+                err = res.get("error") or ""
+        if err.startswith("блок не поставлен"):
+            res["hint"] = ("возможные причины: целевая клетка пересекается с игроком (отойди), опорный блок не твёрдый, "
+                           "в руке не блок")
+    finally:
+        if sneak:
+            api("POST", "/key", {"action": "sneak", "down": False})
+    return json.dumps(res, ensure_ascii=False)
 
 
 # ------------------------------------------------------------------ наблюдение за последствиями
@@ -881,9 +1109,15 @@ def run_tool(name, args):
         return call_api("GET", f"/find?kind={args.get('kind', 'block')}&q={urllib.parse.quote(args['q'])}"
                                f"&r={int(args.get('r', 16))}&max={int(args.get('max', 10))}")
     if name == "minecraft_mine":
-        return mine(args["block"], int(args.get("count", 1)), int(args.get("radius", 24)))
+        return mine(args["block"], int(args.get("count", 1)), int(args.get("radius", 24)),
+                    default_stops(args), float(args.get("max_seconds", 120)))
     if name == "minecraft_dig_to":
-        return json.dumps(dig_to(int(args["x"]), int(args["y"]), int(args["z"]), int(args.get("max_steps", 60))), ensure_ascii=False)
+        set_active(default_stops(args), float(args.get("max_seconds", 120)))
+        try:
+            res = dig_to(int(args["x"]), int(args["y"]), int(args["z"]), int(args.get("max_steps", 60)))
+        finally:
+            clear_active()
+        return json.dumps(res, ensure_ascii=False)
     if name == "minecraft_collect":
         return json.dumps({"visited": collect(int(args.get("r", 8)))}, ensure_ascii=False)
     if name == "minecraft_surroundings":
@@ -903,7 +1137,15 @@ def run_tool(name, args):
     if name == "minecraft_select_tool":
         return call_api("POST", "/select_tool", {"x": int(args["x"]), "y": int(args["y"]), "z": int(args["z"])})
     if name == "minecraft_recipes":
-        return call_api("GET", "/recipes")
+        # полный список весит ~190 КБ и не влезает в ответ: отдаём только индекс и результат, с фильтром
+        data = api("GET", "/recipes")
+        allr = data.get("recipes", [])
+        q = (args.get("q") or "").strip().lower()
+        lim = int(args.get("max", 40))
+        rows = [{"index": r["index"], "result": ITEM_RE.search(r.get("result", "")).group(0)
+                 if ITEM_RE.search(r.get("result", "")) else r.get("result", "")[:80]}
+                for r in allr if not q or q in r.get("result", "").lower()]
+        return json.dumps({"total_in_book": len(allr), "matched": len(rows), "recipes": rows[:lim]}, ensure_ascii=False)
     if name == "minecraft_craft_id":
         return call_api("POST", "/craft_id", {"index": int(args["index"]), "times": int(args.get("times", 1))})
     if name == "minecraft_debug_book":
@@ -963,7 +1205,8 @@ def run_tool(name, args):
     if name == "minecraft_respawn":
         return call_api("POST", "/respawn", {})
     if name == "minecraft_chop_tree":
-        return chop_tree(int(args.get("radius", 12)), int(args.get("max_logs", 6)))
+        return chop_tree(int(args.get("radius", 12)), int(args.get("max_logs", 6)),
+                         default_stops(args), float(args.get("max_seconds", 120)))
     if name == "minecraft_nearby":
         return call_api("GET", f"/nearby?r={int(args.get('r', 4))}")
     if name == "minecraft_look_at":
