@@ -602,17 +602,26 @@ def with_station(kind, fn):
 
 def craft_item(item, count=1):
     item = norm_item(item)
-    before = count_of(inv_counts(), item)
-    book = api("GET", "/recipes")
-    idxs = [r["index"] for r in book.get("recipes", []) if result_matches(r.get("result", ""), item)]
+    inv_before = inv_counts()
+    before = count_of(inv_before, item)
+
+    def find_idxs():
+        # индексы зависят от открытого меню (инвентарь/верстак) и меняются при открытии новых рецептов,
+        # поэтому берём свежий список непосредственно перед каждым craft_id
+        book = api("GET", "/recipes")
+        return [r["index"] for r in book.get("recipes", []) if result_matches(r.get("result", ""), item)]
+
+    idxs = find_idxs()
 
     def attempt_loop():
+        nonlocal idxs
         stalled = 0
         last_err = None
         for _ in range(count * 2 + 2):
             have = count_of(inv_counts(), item) - before
             if have >= count:
                 return True, None
+            idxs = find_idxs()
             if idxs:
                 r = api("POST", "/craft_id", {"index": idxs[0], "times": 1})
             else:
@@ -633,8 +642,15 @@ def craft_item(item, count=1):
         via = "верстак"
         res = with_station("crafting_table", lambda: dict(zip(("ok", "error"), attempt_loop())))
         ok, err = res.get("ok"), res.get("error")
-    made = count_of(inv_counts(), item) - before
+    inv_after = inv_counts()
+    made = count_of(inv_after, item) - before
     out = {"ok": bool(ok), "item": item, "made": made, "via": via}
+    # предупреждение, если скрафтилось что-то постороннее (признак сбившегося индекса рецепта)
+    extra = {short(i): c - inv_before.get(i, 0) for i, c in inv_after.items()
+             if c > inv_before.get(i, 0) and i != item and not short(i).endswith(("_planks", "stick"))
+             and short(i) not in ("raw_iron", "coal", "cobblestone", "dirt", "leaf_litter")}
+    if extra:
+        out["unexpected_new_items"] = extra
     if not ok:
         out["error"] = err
         if not idxs:
