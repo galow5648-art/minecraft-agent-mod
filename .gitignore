@@ -1,0 +1,5 @@
+*.pyc
+.gradle/
+__pycache__/
+build/
+javac.*.args
