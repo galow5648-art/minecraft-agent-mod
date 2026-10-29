@@ -14,6 +14,16 @@ KEY_ACTIONS = ["forward", "back", "left", "right", "jump", "sneak", "sprint", "a
 
 TOOLS = [
     {
+        "name": "minecraft_recipes",
+        "description": "Все рецепты из книги рецептов игрока: индекс, описание результата. Индекс нужен для minecraft_craft_id.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "minecraft_craft_id",
+        "description": "Крафт по индексу из minecraft_recipes (игровой автокрафт из инвентаря). times — сколько раз.",
+        "inputSchema": {"type": "object", "properties": {"index": {"type": "integer"}, "times": {"type": "integer", "minimum": 1, "maximum": 64}}, "required": ["index"]},
+    },
+    {
         "name": "minecraft_debug_book",
         "description": "Служебный: дамп записей книги рецептов и коллекций (для автокрафта).",
         "inputSchema": {"type": "object", "properties": {}},
@@ -203,6 +213,10 @@ def situation(radius=8):
 
 
 def run_tool(name, args):
+    if name == "minecraft_recipes":
+        return call_api("GET", "/recipes")
+    if name == "minecraft_craft_id":
+        return call_api("POST", "/craft_id", {"index": int(args["index"]), "times": int(args.get("times", 1))})
     if name == "minecraft_debug_book":
         return call_api("GET", "/debug_book")
     if name == "minecraft_debug_sync":

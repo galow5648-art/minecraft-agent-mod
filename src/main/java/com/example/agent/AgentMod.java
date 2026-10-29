@@ -28,6 +28,7 @@ import net.minecraft.world.phys.AABB;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.CraftingMenu;
+import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Monster;
@@ -114,6 +115,13 @@ public class AgentMod implements ClientModInitializer {
             server.createContext("/debug_recipes", ex -> send(ex, 200, dumpRecipes()));
             server.createContext("/debug_sync", ex -> respondFromGame(ex, AgentMod::dumpSync));
             server.createContext("/debug_book", ex -> respondFromGame(ex, AgentMod::dumpBook));
+            server.createContext("/recipes", ex -> respondFromGame(ex, AgentMod::recipesJson));
+            server.createContext("/craft_id", ex -> {
+                String b = read(ex);
+                int idx = (int) num(b, "index");
+                int times = clamp((int) num(b, "times"), 1, 64);
+                respondFromGame(ex, () -> craftById(idx, times));
+            });
             server.createContext("/entities", ex -> {
                 int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
                 respondFromGame(ex, () -> entities(r));
@@ -733,6 +741,85 @@ public class AgentMod implements ClientModInitializer {
             }
         }
         return sb.toString();
+    }
+
+    /** Записи книги рецептов игрока (рефлексия: поле ClientRecipeBook -> getCollections -> getRecipes). */
+    private static java.util.List<Object> bookEntries() throws ReflectiveOperationException {
+        LocalPlayer p = Minecraft.getInstance().player;
+        java.util.List<Object> out = new java.util.ArrayList<>();
+        if (p == null) return out;
+        Object book = null;
+        for (Class<?> c = p.getClass(); c != null && book == null; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (f.getType().getName().endsWith("ClientRecipeBook")) {
+                    f.setAccessible(true);
+                    book = f.get(p);
+                    break;
+                }
+            }
+        }
+        if (book == null) return out;
+        Object cols = book.getClass().getMethod("getCollections").invoke(book);
+        for (Object col : (java.util.List<?>) cols) {
+            java.util.List<?> recs = (java.util.List<?>) col.getClass().getMethod("getRecipes").invoke(col);
+            out.addAll(recs);
+        }
+        return out;
+    }
+
+    private static String recipesJson() {
+        try {
+            StringBuilder sb = new StringBuilder("{\"recipes\":[");
+            int idx = 0;
+            boolean first = true;
+            for (Object e : bookEntries()) {
+                Object id = e.getClass().getMethod("id").invoke(e);
+                int rid = (Integer) id.getClass().getMethod("index").invoke(id);
+                Object display = e.getClass().getMethod("display").invoke(e);
+                Object result = display.getClass().getMethod("result").invoke(display);
+                if (!first) sb.append(',');
+                first = false;
+                sb.append("{\"index\":").append(rid)
+                  .append(",\"result\":\"").append(escape(String.valueOf(result))).append("\"}");
+                idx++;
+            }
+            sb.append("],\"count\":").append(idx).append('}');
+            return sb.toString();
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            return "{\"error\":\"" + escape(ex.toString()) + "\"}";
+        }
+    }
+
+    /** Крафт по индексу записи книги: игровой автокрафт, затем забираем результат. */
+    private static String craftById(int index, int times) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            return "{\"ok\":false,\"error\":\"нет игрока в мире\"}";
+        }
+        try {
+            int done = 0;
+            for (int t = 0; t < times; t++) {
+                RecipeDisplayId target = null;
+                for (Object e : bookEntries()) {
+                    Object id = e.getClass().getMethod("id").invoke(e);
+                    if ((Integer) id.getClass().getMethod("index").invoke(id) == index) {
+                        target = (RecipeDisplayId) id;
+                        break;
+                    }
+                }
+                if (target == null) {
+                    return "{\"ok\":false,\"crafted\":" + done + ",\"error\":\"рецепт с индексом " + index + " не найден в книге\"}";
+                }
+                int menuId = p.containerMenu.containerId;
+                mc.gameMode.handlePlaceRecipe(menuId, target, false);
+                mc.gameMode.handleContainerInput(menuId, 0, 0, ContainerInput.QUICK_MOVE, p);
+                done++;
+            }
+            return "{\"ok\":true,\"crafted\":" + done + "}";
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            return "{\"ok\":false,\"error\":\"" + escape(ex.toString()) + "\"}";
+        }
     }
 
     private static String blockId(BlockState st) {
