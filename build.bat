@@ -59,9 +59,13 @@ cd /d "%~dp0"
 call "%TOOLS%\gradle-9.7.1\bin\gradle.bat" build --no-daemon
 if errorlevel 1 goto :fail
 
-rem ---- 4. Copy to mods ----
+rem ---- 4. Copy to mods (remove old versions of this mod first) ----
 set "MODS=%APPDATA%\.tlauncher\legacy\minecraft\game\mods"
 if not exist "%MODS%" mkdir "%MODS%"
+if exist "%MODS%\minecraft-agent-mod-*.jar" (
+  echo Removing old version of the mod...
+  del /q "%MODS%\minecraft-agent-mod-*.jar"
+)
 copy /y "%~dp0build\libs\minecraft-agent-mod-1.0.0.jar" "%MODS%\" >nul
 if errorlevel 1 goto :fail
 
