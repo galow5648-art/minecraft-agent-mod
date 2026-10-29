@@ -25,6 +25,8 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.InteractionHand;
@@ -236,9 +238,125 @@ public class AgentMod implements ClientModInitializer {
         return sb.toString();
     }
 
-    /** Крафт пока не подключён: API рецептов для Minecraft 26.3 ещё не проверен. */
+    /** Рецепт по шаблону: строки сетки, P=любые доски, L=любое бревно, S=палка, C=булыжник, _=пусто. */
+    private record CraftRecipe(String item, int yield, String[] rows) {}
+
+    private static final CraftRecipe[] RECIPES = {
+        new CraftRecipe("planks", 4, new String[]{"L"}),
+        new CraftRecipe("minecraft:stick", 4, new String[]{"P", "P"}),
+        new CraftRecipe("minecraft:crafting_table", 1, new String[]{"PP", "PP"}),
+        new CraftRecipe("minecraft:wooden_pickaxe", 1, new String[]{"PPP", "_S_", "_S_"}),
+        new CraftRecipe("minecraft:wooden_axe", 1, new String[]{"PP", "PS", "_S"}),
+        new CraftRecipe("minecraft:wooden_shovel", 1, new String[]{"P", "S", "S"}),
+        new CraftRecipe("minecraft:wooden_sword", 1, new String[]{"P", "P", "S"}),
+        new CraftRecipe("minecraft:wooden_hoe", 1, new String[]{"PP", "_S", "_S"}),
+        new CraftRecipe("minecraft:stone_pickaxe", 1, new String[]{"CCC", "_S_", "_S_"}),
+        new CraftRecipe("minecraft:stone_axe", 1, new String[]{"CC", "CS", "_S"}),
+        new CraftRecipe("minecraft:stone_shovel", 1, new String[]{"C", "S", "S"}),
+        new CraftRecipe("minecraft:stone_sword", 1, new String[]{"C", "C", "S"}),
+    };
+
+    /** Крафт через клики по слотам открытого меню (инвентарь 2x2 или верстак 3x3). */
     private static String craft(String itemId, int times) {
-        return "{\"ok\":false,\"error\":\"крафт пока не реализован в этой версии мода\",\"item\":\"" + escape(itemId) + "\"}";
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            return "{\"ok\":false,\"error\":\"нет игрока в мире\"}";
+        }
+        CraftRecipe rec = null;
+        if (itemId.endsWith("_planks")) {
+            rec = RECIPES[0];
+        } else {
+            for (CraftRecipe r : RECIPES) {
+                if (r.item().equals(itemId)) { rec = r; break; }
+            }
+        }
+        if (rec == null) {
+            return "{\"ok\":false,\"error\":\"нет шаблона рецепта для " + escape(itemId) + "\"}";
+        }
+        AbstractContainerMenu menu = p.containerMenu;
+        int w = menu.getGridWidth();
+        int h = menu.getGridHeight();
+        int rh = rec.rows().length;
+        int rw = rec.rows()[0].length();
+        if (rw > w || rh > h) {
+            return "{\"ok\":false,\"error\":\"нужен верстак (сетка 3x3) для " + escape(itemId) + "\"}";
+        }
+        if (!menu.getCarried().isEmpty()) {
+            return "{\"ok\":false,\"error\":\"в руке предмет, положи его в инвентарь\"}";
+        }
+        // Для досок берём конкретное дерево из id, например minecraft:spruce_planks -> spruce.
+        String wood = itemId.endsWith("_planks") ? itemId.substring("minecraft:".length(), itemId.length() - "_planks".length()) : null;
+        int playerStart = (w == 2) ? 9 : 10;
+        int crafted = 0;
+        String error = null;
+        for (int t = 0; t < times; t++) {
+            error = craftOnce(mc, p, menu, rec, w, playerStart, wood);
+            if (error != null) break;
+            crafted++;
+        }
+        return "{\"ok\":" + (crafted > 0) + ",\"crafted\":" + (crafted * rec.yield())
+                + ",\"item\":\"" + escape(itemId) + "\""
+                + (error != null ? ",\"error\":\"" + escape(error) + "\"" : "") + "}";
+    }
+
+    private static String craftOnce(Minecraft mc, LocalPlayer p, AbstractContainerMenu menu, CraftRecipe rec,
+                                    int w, int playerStart, String wood) {
+        int menuId = menu.containerId;
+        String[] rows = rec.rows();
+        for (int r = 0; r < rows.length; r++) {
+            for (int c = 0; c < rows[r].length(); c++) {
+                char ch = rows[r].charAt(c);
+                if (ch == '_') continue;
+                int src = findSource(menu, playerStart, ch, wood);
+                if (src < 0) {
+                    return "не хватает ингредиента: " + describe(ch, wood);
+                }
+                int grid = 1 + r * w + c;
+                // Берём стак, кладём один предмет в ячейку правой кнопкой, остаток возвращаем.
+                handleClick(mc, p, menuId, src, 0, ContainerInput.PICKUP);
+                handleClick(mc, p, menuId, grid, 1, ContainerInput.PICKUP);
+                handleClick(mc, p, menuId, src, 0, ContainerInput.PICKUP);
+            }
+        }
+        // Забираем результат (слот 0) в инвентарь.
+        handleClick(mc, p, menuId, 0, 0, ContainerInput.QUICK_MOVE);
+        return null;
+    }
+
+    private static void handleClick(Minecraft mc, LocalPlayer p, int menuId, int slot, int button, ContainerInput type) {
+        mc.gameMode.handleContainerInput(menuId, slot, button, type, p);
+    }
+
+    private static int findSource(AbstractContainerMenu menu, int playerStart, char ch, String wood) {
+        int size = menu.getItems().size();
+        for (int i = playerStart; i < size; i++) {
+            ItemStack st = (ItemStack) menu.getItems().get(i);
+            if (st.isEmpty()) continue;
+            String id = String.valueOf(BuiltInRegistries.ITEM.getKey(st.getItem()));
+            if (matches(ch, id, wood)) return i;
+        }
+        return -1;
+    }
+
+    private static boolean matches(char ch, String id, String wood) {
+        return switch (ch) {
+            case 'L' -> wood == null ? id.endsWith("_log") : id.equals("minecraft:" + wood + "_log");
+            case 'P' -> wood == null ? id.endsWith("_planks") : id.equals("minecraft:" + wood + "_planks");
+            case 'S' -> id.equals("minecraft:stick");
+            case 'C' -> id.equals("minecraft:cobblestone");
+            default -> false;
+        };
+    }
+
+    private static String describe(char ch, String wood) {
+        return switch (ch) {
+            case 'L' -> "бревно";
+            case 'P' -> wood == null ? "доски" : "доски " + wood;
+            case 'S' -> "палка";
+            case 'C' -> "булыжник";
+            default -> "?";
+        };
     }
 
     private static String lookAt() {
