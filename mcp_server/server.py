@@ -14,6 +14,11 @@ KEY_ACTIONS = ["forward", "back", "left", "right", "jump", "sneak", "sprint", "a
 
 TOOLS = [
     {
+        "name": "minecraft_debug_api",
+        "description": "Служебный: список классов и методов игры для крафта (дамп API).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "minecraft_situation",
         "description": "Сводка ситуации: здоровье, голод, инвентарь (брёвна, доски, палки, камень, земля, инструменты), мобы рядом, предметы на земле, ближайшее бревно.",
         "inputSchema": {"type": "object", "properties": {"radius": {"type": "integer", "minimum": 2, "maximum": 12}}},
@@ -183,6 +188,8 @@ def situation(radius=8):
 
 
 def run_tool(name, args):
+    if name == "minecraft_debug_api":
+        return call_api("GET", "/debug_api")
     if name == "minecraft_situation":
         return situation(int(args.get("radius", 8)))
     if name == "minecraft_entities":

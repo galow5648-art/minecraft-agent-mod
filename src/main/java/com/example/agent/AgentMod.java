@@ -106,6 +106,7 @@ public class AgentMod implements ClientModInitializer {
             server.createContext("/look_at", ex -> respondFromGame(ex, AgentMod::lookAt));
             server.createContext("/inventory", ex -> respondFromGame(ex, AgentMod::inventory));
             server.createContext("/job", ex -> send(ex, 200, jobJson()));
+            server.createContext("/debug_api", ex -> send(ex, 200, dumpApi()));
             server.createContext("/entities", ex -> {
                 int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
                 respondFromGame(ex, () -> entities(r));
@@ -393,6 +394,54 @@ public class AgentMod implements ClientModInitializer {
         BlockHitResult bhr = new BlockHitResult(hit, Direction.UP, target, false);
         mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, bhr);
         finish(j, "done", null);
+    }
+
+    /** Служебный дамп API игры (имена классов и методов для крафта). Только для разработки. */
+    private static String dumpApi() {
+        String[] classes = {
+            "net.minecraft.client.multiplayer.MultiPlayerGameMode",
+            "net.minecraft.client.multiplayer.ClientPacketListener",
+            "net.minecraft.client.multiplayer.ClientLevel",
+            "net.minecraft.world.level.Level",
+            "net.minecraft.world.inventory.AbstractContainerMenu",
+            "net.minecraft.world.inventory.CraftingMenu",
+            "net.minecraft.world.inventory.ClickType",
+            "net.minecraft.world.inventory.ContainerInput",
+            "net.minecraft.world.inventory.InventoryMenu",
+            "net.minecraft.world.item.crafting.RecipeManager",
+            "net.minecraft.world.item.crafting.RecipeHolder",
+            "net.minecraft.world.item.crafting.CraftingRecipe",
+            "net.minecraft.world.item.crafting.Recipe",
+            "net.minecraft.world.item.crafting.RecipeAccess",
+            "net.minecraft.world.item.crafting.RecipeMap",
+            "net.minecraft.world.item.crafting.ShapedRecipe",
+            "net.minecraft.world.item.crafting.ShapelessRecipe"
+        };
+        java.util.regex.Pattern keep = java.util.regex.Pattern.compile(
+            "(?i)craft|recipe|click|place|slot|container|menu|inventory|input|quick|pickup|result|book|manager|value|holder");
+        StringBuilder sb = new StringBuilder();
+        for (String name : classes) {
+            try {
+                Class<?> c = Class.forName(name);
+                sb.append("## ").append(name).append('\n');
+                if (c.isEnum()) {
+                    for (Object o : c.getEnumConstants()) sb.append("  const ").append(o).append('\n');
+                }
+                for (java.lang.reflect.Method m : c.getMethods()) {
+                    if (!keep.matcher(m.getName()).find() && !keep.matcher(c.getSimpleName()).find()) continue;
+                    sb.append("  ").append(m.getReturnType().getName()).append(' ').append(m.getName()).append('(');
+                    Class<?>[] ps = m.getParameterTypes();
+                    for (int i = 0; i < ps.length; i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(ps[i].getName());
+                    }
+                    sb.append(")\n");
+                }
+            } catch (ClassNotFoundException | LinkageError e) {
+                sb.append("## MISSING ").append(name).append('\n');
+            }
+        }
+        return sb.toString();
     }
 
     private static String blockId(BlockState st) {
