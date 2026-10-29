@@ -537,16 +537,37 @@ public class AgentMod implements ClientModInitializer {
         };
         java.util.regex.Pattern keep = java.util.regex.Pattern.compile(
             "(?i)craft|recipe|click|place|slot|container|menu|inventory|input|quick|pickup|result|book|manager|value|holder");
+        // Эти классы выводим целиком, без фильтра по словам.
+        java.util.Set<String> full = java.util.Set.of(
+            "net.minecraft.world.item.crafting.Ingredient",
+            "net.minecraft.world.item.crafting.PlacementInfo",
+            "net.minecraft.world.item.crafting.ShapelessRecipe",
+            "net.minecraft.world.item.crafting.ShapedRecipe",
+            "net.minecraft.world.item.crafting.RecipeType",
+            "net.minecraft.world.item.crafting.display.RecipeDisplay",
+            "net.minecraft.world.item.ItemStack",
+            "net.minecraft.world.item.Item");
+        String[] extra = {
+            "net.minecraft.world.item.crafting.Ingredient",
+            "net.minecraft.world.item.crafting.PlacementInfo",
+            "net.minecraft.world.item.crafting.RecipeType",
+            "net.minecraft.world.item.crafting.display.RecipeDisplay",
+            "net.minecraft.world.item.ItemStack",
+            "net.minecraft.world.item.Item"
+        };
+        classes = java.util.stream.Stream.concat(java.util.Arrays.stream(classes),
+                java.util.Arrays.stream(extra)).distinct().toArray(String[]::new);
         StringBuilder sb = new StringBuilder();
         for (String name : classes) {
             try {
                 Class<?> c = Class.forName(name);
                 sb.append("## ").append(name).append('\n');
+                boolean all = full.contains(name);
                 if (c.isEnum()) {
                     for (Object o : c.getEnumConstants()) sb.append("  const ").append(o).append('\n');
                 }
                 for (java.lang.reflect.Method m : c.getMethods()) {
-                    if (!keep.matcher(m.getName()).find() && !keep.matcher(c.getSimpleName()).find()) continue;
+                    if (!all && !keep.matcher(m.getName()).find() && !keep.matcher(c.getSimpleName()).find()) continue;
                     sb.append("  ").append(m.getReturnType().getName()).append(' ').append(m.getName()).append('(');
                     Class<?>[] ps = m.getParameterTypes();
                     for (int i = 0; i < ps.length; i++) {
