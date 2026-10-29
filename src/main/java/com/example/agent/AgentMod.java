@@ -290,14 +290,42 @@ public class AgentMod implements ClientModInitializer {
         return def;
     }
 
+    /** Имя открытого экрана через рефлексию (в 26.3 поле screen недоступно напрямую). */
+    private static String screenJson(Minecraft mc) {
+        Object scr = null;
+        try {
+            for (String name : new String[]{"screen", "getScreen", "currentScreen"}) {
+                try {
+                    java.lang.reflect.Method m = Minecraft.class.getMethod(name);
+                    scr = m.invoke(mc);
+                    break;
+                } catch (NoSuchMethodException ignored) {
+                    // пробуем следующий вариант
+                }
+            }
+            if (scr == null) {
+                for (java.lang.reflect.Field f : Minecraft.class.getDeclaredFields()) {
+                    if (f.getName().equals("screen")) {
+                        f.setAccessible(true);
+                        scr = f.get(mc);
+                        break;
+                    }
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return "\"?\"";
+        }
+        return scr == null ? "null" : "\"" + escape(scr.getClass().getSimpleName()) + "\"";
+    }
+
     private static String status() {
         Minecraft mc = Minecraft.getInstance();
         LocalPlayer p = mc.player;
         if (p == null || mc.level == null) {
-            return "{\"inWorld\":false,\"screen\":" + (mc.screen == null ? "null" : "\"" + escape(mc.screen.getClass().getSimpleName()) + "\"") + "}";
+            return "{\"inWorld\":false,\"screen\":" + screenJson(mc) + "}";
         }
         return "{\"inWorld\":true"
-                + ",\"screen\":" + (mc.screen == null ? "null" : "\"" + escape(mc.screen.getClass().getSimpleName()) + "\"")
+                + ",\"screen\":" + screenJson(mc)
                 + ",\"menu\":\"" + escape(p.containerMenu.getClass().getSimpleName()) + "\""
                 + ",\"dimension\":\"" + escape(String.valueOf(mc.level.dimension())) + "\""
                 + ",\"health\":" + round(p.getHealth())
