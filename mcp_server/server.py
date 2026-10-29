@@ -14,6 +14,21 @@ KEY_ACTIONS = ["forward", "back", "left", "right", "jump", "sneak", "sprint", "a
 
 TOOLS = [
     {
+        "name": "minecraft_nearby",
+        "description": "Блоки вокруг игрока в кубе радиуса r (1–12): координаты и id блока, воздух не возвращается.",
+        "inputSchema": {"type": "object", "properties": {"r": {"type": "integer", "minimum": 1, "maximum": 12}}},
+    },
+    {
+        "name": "minecraft_look_at",
+        "description": "Блок, на который сейчас смотрит прицел: координаты, id, грань, расстояние. target=null если смотрим в воздух.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "minecraft_inventory",
+        "description": "Инвентарь игрока: непустые слоты с id предмета, количеством и прочностью инструментов.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "minecraft_state",
         "description": "Состояние персонажа: координаты, взгляд (yaw/pitch), здоровье, голод, выбранный слот.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -66,6 +81,13 @@ def call_api(method, path, payload=None):
 
 
 def run_tool(name, args):
+    if name == "minecraft_nearby":
+        r = int(args.get("r", 8))
+        return call_api("GET", f"/nearby?r={r}")
+    if name == "minecraft_look_at":
+        return call_api("GET", "/look_at")
+    if name == "minecraft_inventory":
+        return call_api("GET", "/inventory")
     if name == "minecraft_state":
         return call_api("GET", "/state")
     if name == "minecraft_key":
