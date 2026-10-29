@@ -23,6 +23,10 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.core.Direction;
 
 /**
  * Локальный HTTP-API только на 127.0.0.1:8765.
@@ -32,6 +36,17 @@ public class AgentMod implements ClientModInitializer {
     public static final int PORT = 8765;
     private static final ConcurrentLinkedQueue<Runnable> TASKS = new ConcurrentLinkedQueue<>();
     private static volatile String lastState = "{\"inWorld\":false}";
+
+    /** Текущая задача, которая выполняется в клиентском тике. */
+    private static final class Job {
+        final String type;
+        final int x, y, z;
+        final long startedMs = System.currentTimeMillis();
+        String status = "running";
+        String error = null;
+        Job(String type, int x, int y, int z) { this.type = type; this.x = x; this.y = y; this.z = z; }
+    }
+    private static volatile Job job = null;
 
     @Override
     public void onInitializeClient() {
@@ -44,6 +59,7 @@ public class AgentMod implements ClientModInitializer {
                     System.err.println("[agent] ошибка команды: " + e);
                 }
             }
+            tickJob(mc);
             lastState = buildState(mc);
         });
 
@@ -86,6 +102,25 @@ public class AgentMod implements ClientModInitializer {
             });
             server.createContext("/look_at", ex -> respondFromGame(ex, AgentMod::lookAt));
             server.createContext("/inventory", ex -> respondFromGame(ex, AgentMod::inventory));
+            server.createContext("/job", ex -> send(ex, 200, jobJson()));
+            server.createContext("/break", ex -> {
+                String b = read(ex);
+                int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
+                job = new Job("break", x, y, z);
+                send(ex, 200, "{\"ok\":true}");
+            });
+            server.createContext("/goto", ex -> {
+                String b = read(ex);
+                int x = (int) Math.floor(num(b, "x")), y = (int) num(b, "y"), z = (int) Math.floor(num(b, "z"));
+                job = new Job("goto", x, y, z);
+                send(ex, 200, "{\"ok\":true}");
+            });
+            server.createContext("/place", ex -> {
+                String b = read(ex);
+                int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
+                job = new Job("place", x, y, z);
+                send(ex, 200, "{\"ok\":true}");
+            });
             server.setExecutor(null);
             server.start();
             System.out.println("[agent] API запущен на http://127.0.0.1:" + PORT);
@@ -194,6 +229,117 @@ public class AgentMod implements ClientModInitializer {
         }
         sb.append("]}");
         return sb.toString();
+    }
+
+    private static String jobJson() {
+        Job j = job;
+        if (j == null) {
+            return "{\"status\":\"idle\"}";
+        }
+        return "{\"status\":\"" + j.status + "\",\"type\":\"" + j.type + "\""
+                + (j.error != null ? ",\"error\":\"" + escape(j.error) + "\"" : "") + "}";
+    }
+
+    /** Выполняется каждый клиентский тик, пока есть задача. */
+    private static void tickJob(Minecraft mc) {
+        Job j = job;
+        if (j == null || !"running".equals(j.status)) {
+            return;
+        }
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            finish(j, "failed", "нет игрока в мире");
+            return;
+        }
+        if (System.currentTimeMillis() - j.startedMs > 30_000) {
+            releaseKeys(mc);
+            finish(j, "failed", "таймаут");
+            return;
+        }
+        switch (j.type) {
+            case "break" -> tickBreak(mc, p, j);
+            case "goto" -> tickGoto(mc, p, j);
+            case "place" -> tickPlace(mc, p, j);
+            default -> finish(j, "failed", "неизвестная задача");
+        }
+    }
+
+    private static void finish(Job j, String status, String error) {
+        j.status = status;
+        j.error = error;
+        releaseKeys(Minecraft.getInstance());
+    }
+
+    private static void releaseKeys(Minecraft mc) {
+        var o = mc.options;
+        o.keyAttack.setDown(false);
+        o.keyUse.setDown(false);
+        o.keyUp.setDown(false);
+        o.keyJump.setDown(false);
+    }
+
+    private static void lookAtPoint(LocalPlayer p, double tx, double ty, double tz) {
+        double dx = tx - p.getX();
+        double dy = ty - p.getEyeY();
+        double dz = tz - p.getZ();
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        float yaw = (float) (Math.toDegrees(Math.atan2(-dx, dz)));
+        float pitch = (float) (-Math.toDegrees(Math.atan2(dy, horiz)));
+        p.setYRot(yaw);
+        p.setXRot(Math.max(-90f, Math.min(90f, pitch)));
+    }
+
+    private static void tickBreak(Minecraft mc, LocalPlayer p, Job j) {
+        BlockPos pos = new BlockPos(j.x, j.y, j.z);
+        if (mc.level.getBlockState(pos).isAir()) {
+            releaseKeys(mc);
+            finish(j, "done", null);
+            return;
+        }
+        double dist = Math.sqrt(p.distanceToSqr(j.x + 0.5, j.y + 0.5, j.z + 0.5));
+        if (dist > 4.5) {
+            finish(j, "failed", "блок слишком далеко (" + round(dist) + " м), сначала /goto");
+            return;
+        }
+        lookAtPoint(p, j.x + 0.5, j.y + 0.5, j.z + 0.5);
+        mc.options.keyAttack.setDown(true);
+    }
+
+    private static void tickGoto(Minecraft mc, LocalPlayer p, Job j) {
+        double tx = j.x + 0.5, tz = j.z + 0.5;
+        double dx = tx - p.getX(), dz = tz - p.getZ();
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        if (horiz < 0.6) {
+            releaseKeys(mc);
+            finish(j, "done", null);
+            return;
+        }
+        p.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        mc.options.keyUp.setDown(true);
+        // Прыжок, если впереди блок на уровне ног, а над ним есть место.
+        BlockPos ahead = BlockPos.containing(p.getX() + dx / horiz * 0.8, p.getY(), p.getZ() + dz / horiz * 0.8);
+        boolean wallAhead = !mc.level.getBlockState(ahead).isAir();
+        boolean headFree = mc.level.getBlockState(ahead.above()).isAir();
+        mc.options.keyJump.setDown(p.onGround() && wallAhead && headFree);
+    }
+
+    private static void tickPlace(Minecraft mc, LocalPlayer p, Job j) {
+        // Ставим блок сверху на блок (x, y, z): смотрим на его верхнюю грань.
+        BlockPos target = new BlockPos(j.x, j.y, j.z);
+        if (mc.level.getBlockState(target).isAir()) {
+            finish(j, "failed", "на этом месте нет опоры");
+            return;
+        }
+        double dist = Math.sqrt(p.distanceToSqr(j.x + 0.5, j.y + 1.0, j.z + 0.5));
+        if (dist > 4.5) {
+            finish(j, "failed", "блок слишком далеко, сначала /goto");
+            return;
+        }
+        lookAtPoint(p, j.x + 0.5, j.y + 1.0, j.z + 0.5);
+        Vec3 hit = new Vec3(j.x + 0.5, j.y + 1.0, j.z + 0.5);
+        BlockHitResult bhr = new BlockHitResult(hit, Direction.UP, target, false);
+        mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, bhr);
+        finish(j, "done", null);
     }
 
     private static String blockId(BlockState st) {
