@@ -6,7 +6,13 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -33,8 +39,8 @@ import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.core.Direction;
+import net.minecraft.world.entity.Entity;
 
 /**
  * Локальный HTTP-API только на 127.0.0.1:8765.
@@ -46,14 +52,32 @@ public class AgentMod implements ClientModInitializer {
     private static volatile String lastState = "{\"inWorld\":false}";
 
     /** Текущая задача, которая выполняется в клиентском тике. */
+    private static final AtomicInteger JOB_IDS = new AtomicInteger();
     private static final class Job {
+        final int id = JOB_IDS.incrementAndGet();
         final String type;
         final int x, y, z;
         final long startedMs = System.currentTimeMillis();
-        String status = "running";
-        String error = null;
-        Job(String type, int x, int y, int z) { this.type = type; this.x = x; this.y = y; this.z = z; }
+        long timeoutMs = 30_000;
+        volatile String status = "running";
+        volatile String error = null;
+        volatile String info = null;
+        // состояние goto
+        List<BlockPos> path = null;
+        int idx = 0;
+        int replans = 0;
+        long lastCheckMs = 0;
+        double lastX, lastZ;
+        // состояние break и open
+        int occludedTicks = 0;
+        boolean toolChosen = false;
+        long lastUseMs = 0;
+        Job(String type, int x, int y, int z) {
+            this.type = type; this.x = x; this.y = y; this.z = z;
+            this.timeoutMs = switch (type) { case "goto" -> 90_000; case "break" -> 25_000; case "place" -> 5_000; default -> 30_000; };
+        }
     }
+    private static volatile boolean focusFixed = false;
     private static volatile Job job = null;
 
     @Override
@@ -67,21 +91,22 @@ public class AgentMod implements ClientModInitializer {
                     System.err.println("[agent] ошибка команды: " + e);
                 }
             }
+            fixFocus(mc);
             tickJob(mc);
             lastState = buildState(mc);
         });
 
         try {
             HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", PORT), 0);
-            server.createContext("/state", ex -> send(ex, 200, lastState));
-            server.createContext("/key", ex -> {
+            route(server, "/state", ex -> send(ex, 200, lastState));
+            route(server, "/key", ex -> {
                 String body = read(ex);
                 String action = field(body, "action");
                 boolean down = body.contains("\"down\":true") || body.contains("\"down\": true");
                 TASKS.add(() -> setKey(action, down));
                 send(ex, 200, "{\"ok\":true}");
             });
-            server.createContext("/look", ex -> {
+            route(server, "/look", ex -> {
                 String body = read(ex);
                 float yaw = (float) num(body, "yaw");
                 float pitch = (float) num(body, "pitch");
@@ -94,7 +119,7 @@ public class AgentMod implements ClientModInitializer {
                 });
                 send(ex, 200, "{\"ok\":true}");
             });
-            server.createContext("/slot", ex -> {
+            route(server, "/slot", ex -> {
                 int slot = (int) num(read(ex), "slot");
                 TASKS.add(() -> {
                     LocalPlayer p = Minecraft.getInstance().player;
@@ -104,58 +129,488 @@ public class AgentMod implements ClientModInitializer {
                 });
                 send(ex, 200, "{\"ok\":true}");
             });
-            server.createContext("/nearby", ex -> {
+            route(server, "/nearby", ex -> {
                 int r = clamp((int) queryNum(ex, "r", 8), 1, 12);
                 respondFromGame(ex, () -> nearby(r));
             });
-            server.createContext("/look_at", ex -> respondFromGame(ex, AgentMod::lookAt));
-            server.createContext("/inventory", ex -> respondFromGame(ex, AgentMod::inventory));
-            server.createContext("/job", ex -> send(ex, 200, jobJson()));
-            server.createContext("/debug_api", ex -> send(ex, 200, dumpApi()));
-            server.createContext("/debug_recipes", ex -> send(ex, 200, dumpRecipes()));
-            server.createContext("/debug_sync", ex -> respondFromGame(ex, AgentMod::dumpSync));
-            server.createContext("/debug_book", ex -> respondFromGame(ex, AgentMod::dumpBook));
-            server.createContext("/recipes", ex -> respondFromGame(ex, AgentMod::recipesJson));
-            server.createContext("/craft_id", ex -> {
+            route(server, "/look_at", ex -> respondFromGame(ex, AgentMod::lookAt));
+            route(server, "/inventory", ex -> respondFromGame(ex, AgentMod::inventory));
+            route(server, "/job", ex -> send(ex, 200, jobJson()));
+            route(server, "/debug_api", ex -> send(ex, 200, dumpApi()));
+            route(server, "/debug_recipes", ex -> send(ex, 200, dumpRecipes()));
+            route(server, "/debug_sync", ex -> respondFromGame(ex, AgentMod::dumpSync));
+            route(server, "/debug_book", ex -> respondFromGame(ex, AgentMod::dumpBook));
+            route(server, "/recipes", ex -> respondFromGame(ex, AgentMod::recipesJson));
+            route(server, "/craft_id", ex -> {
                 String b = read(ex);
                 int idx = (int) num(b, "index");
                 int times = clamp((int) num(b, "times"), 1, 64);
                 respondFromGame(ex, () -> craftById(idx, times));
             });
-            server.createContext("/entities", ex -> {
+            route(server, "/entities", ex -> {
                 int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
                 respondFromGame(ex, () -> entities(r));
             });
-            server.createContext("/craft", ex -> {
+            route(server, "/craft", ex -> {
                 String b = read(ex);
                 String item = field(b, "item");
                 int times = clamp((int) num(b, "times"), 1, 64);
                 respondFromGame(ex, () -> craft(item, times));
             });
-            server.createContext("/break", ex -> {
+            route(server, "/break", ex -> {
                 String b = read(ex);
                 int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
-                job = new Job("break", x, y, z);
+                startJob(new Job("break", x, y, z));
                 send(ex, 200, "{\"ok\":true}");
             });
-            server.createContext("/goto", ex -> {
+            route(server, "/goto", ex -> {
                 String b = read(ex);
                 int x = (int) Math.floor(num(b, "x")), y = (int) num(b, "y"), z = (int) Math.floor(num(b, "z"));
-                job = new Job("goto", x, y, z);
+                startJob(new Job("goto", x, y, z));
                 send(ex, 200, "{\"ok\":true}");
             });
-            server.createContext("/place", ex -> {
+            route(server, "/place", ex -> {
                 String b = read(ex);
                 int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
-                job = new Job("place", x, y, z);
+                startJob(new Job("place", x, y, z));
                 send(ex, 200, "{\"ok\":true}");
             });
-            server.setExecutor(null);
+            route(server, "/status", ex -> respondFromGame(ex, AgentMod::status));
+            route(server, "/cancel", ex -> {
+                Job j = job;
+                if (j != null && "running".equals(j.status)) {
+                    j.status = "cancelled";
+                }
+                TASKS.add(() -> releaseKeys(Minecraft.getInstance()));
+                send(ex, 200, "{\"ok\":true}");
+            });
+            route(server, "/find", ex -> {
+                String kind = queryStr(ex, "kind", "block");
+                String q = queryStr(ex, "q", "");
+                int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
+                int max = clamp((int) queryNum(ex, "max", 10), 1, 50);
+                respondFromGame(ex, () -> find(kind, q, r, max));
+            });
+            route(server, "/surroundings", ex -> {
+                int r = clamp((int) queryNum(ex, "r", 8), 2, 16);
+                respondFromGame(ex, () -> surroundings(r));
+            });
+            route(server, "/select_tool", ex -> {
+                String b = read(ex);
+                int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
+                respondFromGame(ex, () -> selectToolJson(x, y, z));
+            });
+            route(server, "/open", ex -> {
+                String b = read(ex);
+                int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
+                Job nj = new Job("open", x, y, z);
+                nj.timeoutMs = 8_000;
+                startJob(nj);
+                send(ex, 200, "{\"ok\":true}");
+            });
+            route(server, "/menu", ex -> respondFromGame(ex, AgentMod::menuJson));
+            route(server, "/click", ex -> {
+                String b = read(ex);
+                int slot = (int) num(b, "slot");
+                int button = (int) num(b, "button");
+                String type = field(b, "type");
+                respondFromGame(ex, () -> clickJson(slot, button, type));
+            });
+            route(server, "/close", ex -> respondFromGame(ex, () -> {
+                LocalPlayer p = Minecraft.getInstance().player;
+                if (p == null) return "{\"ok\":false}";
+                p.closeContainer();
+                return "{\"ok\":true}";
+            }));
+            server.setExecutor(Executors.newFixedThreadPool(4));
             server.start();
             System.out.println("[agent] API запущен на http://127.0.0.1:" + PORT);
         } catch (IOException e) {
             System.err.println("[agent] не удалось запустить API: " + e);
         }
+    }
+
+
+    // ---------------------------------------------------------------- инфраструктура
+
+    /** Обёртка над createContext: запрещает запросы из браузера (заголовок Origin) и ловит исключения. */
+    private static void route(HttpServer server, String path, com.sun.net.httpserver.HttpHandler handler) {
+        server.createContext(path, ex -> {
+            try {
+                if (ex.getRequestHeaders().getFirst("Origin") != null) {
+                    send(ex, 403, "{\"error\":\"запросы из браузера запрещены\"}");
+                    return;
+                }
+                handler.handle(ex);
+            } catch (IOException | RuntimeException e) {
+                try {
+                    send(ex, 500, "{\"error\":\"" + escape(String.valueOf(e)) + "\"}");
+                } catch (IOException ignored) {
+                    // клиент уже отключился
+                }
+            }
+        });
+    }
+
+    /** Новая задача отменяет текущую и отпускает клавиши. */
+    private static void startJob(Job nj) {
+        Job old = job;
+        if (old != null && "running".equals(old.status)) {
+            old.status = "cancelled";
+        }
+        TASKS.add(() -> releaseKeys(Minecraft.getInstance()));
+        job = nj;
+    }
+
+    /** Не ставить игру на паузу при потере фокуса окна (иначе тик замирает и API молчит). */
+    private static void fixFocus(Minecraft mc) {
+        if (focusFixed || mc.options == null) return;
+        focusFixed = true;
+        try {
+            java.lang.reflect.Field f = mc.options.getClass().getField("pauseOnLostFocus");
+            Object cur = f.get(mc.options);
+            if (cur instanceof Boolean) {
+                f.setBoolean(mc.options, false);
+            } else if (cur != null) {
+                cur.getClass().getMethod("set", Object.class).invoke(cur, Boolean.FALSE);
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("[agent] не удалось отключить паузу при потере фокуса: " + e);
+        }
+    }
+
+    private static String queryStr(HttpExchange ex, String name, String def) {
+        String q = ex.getRequestURI().getQuery();
+        if (q == null) return def;
+        for (String part : q.split("&")) {
+            if (part.startsWith(name + "=")) {
+                return java.net.URLDecoder.decode(part.substring(name.length() + 1), StandardCharsets.UTF_8);
+            }
+        }
+        return def;
+    }
+
+    private static String status() {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            return "{\"inWorld\":false,\"screen\":" + (mc.screen == null ? "null" : "\"" + escape(mc.screen.getClass().getSimpleName()) + "\"") + "}";
+        }
+        return "{\"inWorld\":true"
+                + ",\"screen\":" + (mc.screen == null ? "null" : "\"" + escape(mc.screen.getClass().getSimpleName()) + "\"")
+                + ",\"menu\":\"" + escape(p.containerMenu.getClass().getSimpleName()) + "\""
+                + ",\"dimension\":\"" + escape(String.valueOf(mc.level.dimension())) + "\""
+                + ",\"health\":" + round(p.getHealth())
+                + ",\"food\":" + p.getFoodData().getFoodLevel()
+                + ",\"x\":" + round(p.getX()) + ",\"y\":" + round(p.getY()) + ",\"z\":" + round(p.getZ())
+                + ",\"job\":" + jobJson() + "}";
+    }
+
+    // ---------------------------------------------------------------- поиск
+
+    private static String shortId(String id) {
+        return id.startsWith("minecraft:") ? id.substring(10) : id;
+    }
+
+    /** Поиск блоков или сущностей по подстроке id. Сортировка по расстоянию. */
+    private static String find(String kind, String query, int r, int max) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        Level level = mc.level;
+        if (p == null || level == null) {
+            return "{\"inWorld\":false}";
+        }
+        String q = shortId(query.toLowerCase(Locale.ROOT));
+        boolean exact = q.startsWith("=");
+        if (exact) q = q.substring(1);
+        BlockPos base = p.blockPosition();
+        StringBuilder sb = new StringBuilder("{\"kind\":\"" + escape(kind) + "\",\"query\":\"" + escape(q) + "\",\"results\":[");
+        if (kind.equals("entity") || kind.equals("item")) {
+            AABB box = p.getBoundingBox().inflate(r);
+            List<double[]> found = new ArrayList<>();
+            List<String> names = new ArrayList<>();
+            if (kind.equals("item")) {
+                for (ItemEntity ie : level.getEntitiesOfClass(ItemEntity.class, box)) {
+                    String id = shortId(String.valueOf(BuiltInRegistries.ITEM.getKey(ie.getItem().getItem())));
+                    if (!q.isEmpty() && !id.contains(q)) continue;
+                    found.add(new double[]{ie.getX(), ie.getY(), ie.getZ(), ie.getItem().getCount()});
+                    names.add(id);
+                }
+            } else {
+                for (Entity e : level.getEntitiesOfClass(Entity.class, box)) {
+                    if (e == p) continue;
+                    String id = shortId(String.valueOf(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType())));
+                    if (!q.isEmpty() && !id.contains(q)) continue;
+                    found.add(new double[]{e.getX(), e.getY(), e.getZ(), 1});
+                    names.add(id);
+                }
+            }
+            Integer[] order = new Integer[found.size()];
+            for (int i = 0; i < order.length; i++) order[i] = i;
+            java.util.Arrays.sort(order, (a, b) -> Double.compare(dist2(found.get(a), p), dist2(found.get(b), p)));
+            for (int k = 0; k < Math.min(max, order.length); k++) {
+                double[] f = found.get(order[k]);
+                if (k > 0) sb.append(',');
+                sb.append("{\"id\":\"").append(escape(names.get(order[k]))).append("\",\"x\":").append(round(f[0]))
+                  .append(",\"y\":").append(round(f[1])).append(",\"z\":").append(round(f[2]))
+                  .append(",\"count\":").append((int) f[3])
+                  .append(",\"distance\":").append(round(Math.sqrt(dist2(f, p)))).append('}');
+            }
+            sb.append("],\"total\":").append(found.size()).append('}');
+            return sb.toString();
+        }
+        // блоки: сканируем куб радиуса r
+        List<int[]> hits = new ArrayList<>();
+        List<String> ids = new ArrayList<>();
+        BlockPos.MutableBlockPos mp = new BlockPos.MutableBlockPos();
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    mp.set(base.getX() + dx, base.getY() + dy, base.getZ() + dz);
+                    BlockState st = level.getBlockState(mp);
+                    if (st.isAir()) continue;
+                    String id = shortId(blockId(st));
+                    if (exact ? !id.equals(q) : !id.contains(q)) continue;
+                    boolean exposed = false;
+                    for (Direction d : Direction.values()) {
+                        if (level.getBlockState(mp.relative(d)).isAir()) { exposed = true; break; }
+                    }
+                    hits.add(new int[]{mp.getX(), mp.getY(), mp.getZ(), exposed ? 1 : 0});
+                    ids.add(id);
+                }
+            }
+        }
+        Integer[] order = new Integer[hits.size()];
+        for (int i = 0; i < order.length; i++) order[i] = i;
+        java.util.Arrays.sort(order, (a, b) -> Double.compare(blockDist2(hits.get(a), p), blockDist2(hits.get(b), p)));
+        for (int k = 0; k < Math.min(max, order.length); k++) {
+            int[] h = hits.get(order[k]);
+            if (k > 0) sb.append(',');
+            sb.append("{\"id\":\"").append(escape(ids.get(order[k]))).append("\",\"x\":").append(h[0])
+              .append(",\"y\":").append(h[1]).append(",\"z\":").append(h[2])
+              .append(",\"exposed\":").append(h[3] == 1)
+              .append(",\"distance\":").append(round(Math.sqrt(blockDist2(h, p)))).append('}');
+        }
+        sb.append("],\"total\":").append(hits.size()).append('}');
+        return sb.toString();
+    }
+
+    private static double dist2(double[] f, LocalPlayer p) {
+        double dx = f[0] - p.getX(), dy = f[1] - p.getY(), dz = f[2] - p.getZ();
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static double blockDist2(int[] h, LocalPlayer p) {
+        double dx = h[0] + 0.5 - p.getX(), dy = h[1] + 0.5 - p.getY(), dz = h[2] + 0.5 - p.getZ();
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    /** Компактная сводка: сколько блоков каждого типа и где ближайший; руды, жидкости и станки всегда в списке. */
+    private static String surroundings(int r) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        Level level = mc.level;
+        if (p == null || level == null) {
+            return "{\"inWorld\":false}";
+        }
+        BlockPos base = p.blockPosition();
+        Map<String, int[]> agg = new HashMap<>(); // id -> {count, nx, ny, nz, bestDist2}
+        BlockPos.MutableBlockPos mp = new BlockPos.MutableBlockPos();
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    mp.set(base.getX() + dx, base.getY() + dy, base.getZ() + dz);
+                    BlockState st = level.getBlockState(mp);
+                    if (st.isAir()) continue;
+                    String id = shortId(blockId(st));
+                    int d2 = dx * dx + dy * dy + dz * dz;
+                    int[] a = agg.get(id);
+                    if (a == null) {
+                        agg.put(id, new int[]{1, mp.getX(), mp.getY(), mp.getZ(), d2});
+                    } else {
+                        a[0]++;
+                        if (d2 < a[4]) { a[1] = mp.getX(); a[2] = mp.getY(); a[3] = mp.getZ(); a[4] = d2; }
+                    }
+                }
+            }
+        }
+        List<Map.Entry<String, int[]>> list = new ArrayList<>(agg.entrySet());
+        list.sort((a, b) -> Integer.compare(b.getValue()[0], a.getValue()[0]));
+        StringBuilder sb = new StringBuilder("{\"center\":[" + base.getX() + "," + base.getY() + "," + base.getZ() + "],\"blocks\":{");
+        boolean first = true;
+        int shown = 0;
+        for (Map.Entry<String, int[]> e : list) {
+            String id = e.getKey();
+            boolean notable = id.contains("ore") || id.contains("lava") || id.contains("water") || id.contains("table")
+                    || id.contains("furnace") || id.contains("chest") || id.contains("log") || id.contains("portal")
+                    || id.contains("diamond") || id.contains("spawner");
+            if (!notable && shown >= 25) continue;
+            if (!notable) shown++;
+            int[] a = e.getValue();
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(escape(id)).append("\":{\"n\":").append(a[0])
+              .append(",\"nearest\":[").append(a[1]).append(',').append(a[2]).append(',').append(a[3]).append("]}");
+        }
+        sb.append("}}");
+        return sb.toString();
+    }
+
+    // ---------------------------------------------------------------- инструмент и меню
+
+    private static int bestToolSlot(LocalPlayer p, BlockState st) {
+        int best = p.getInventory().getSelectedSlot();
+        float bestSpeed = p.getInventory().getItem(best).getDestroySpeed(st);
+        for (int i = 0; i < 9; i++) {
+            float sp = p.getInventory().getItem(i).getDestroySpeed(st);
+            if (sp > bestSpeed + 0.01f) {
+                best = i;
+                bestSpeed = sp;
+            }
+        }
+        return best;
+    }
+
+    private static String selectToolJson(int x, int y, int z) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) return "{\"ok\":false}";
+        BlockState st = mc.level.getBlockState(new BlockPos(x, y, z));
+        int slot = bestToolSlot(p, st);
+        p.getInventory().setSelectedSlot(slot);
+        return "{\"ok\":true,\"slot\":" + slot + "}";
+    }
+
+    private static String menuJson() {
+        LocalPlayer p = Minecraft.getInstance().player;
+        if (p == null) return "{\"inWorld\":false}";
+        AbstractContainerMenu menu = p.containerMenu;
+        StringBuilder sb = new StringBuilder("{\"type\":\"" + escape(menu.getClass().getSimpleName()) + "\",\"id\":" + menu.containerId + ",\"slots\":[");
+        boolean first = true;
+        int size = menu.getItems().size();
+        for (int i = 0; i < size; i++) {
+            ItemStack st = (ItemStack) menu.getItems().get(i);
+            if (st.isEmpty()) continue;
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{\"slot\":").append(i).append(",\"item\":\"")
+              .append(escape(shortId(String.valueOf(BuiltInRegistries.ITEM.getKey(st.getItem()))))).append("\",\"count\":")
+              .append(st.getCount()).append('}');
+        }
+        sb.append("],\"size\":").append(size).append('}');
+        return sb.toString();
+    }
+
+    private static String clickJson(int slot, int button, String type) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.gameMode == null) return "{\"ok\":false,\"error\":\"нет игрока\"}";
+        ContainerInput ci;
+        try {
+            ci = ContainerInput.valueOf(type == null || type.isEmpty() ? "PICKUP" : type.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            return "{\"ok\":false,\"error\":\"неизвестный тип клика: " + escape(type) + "\"}";
+        }
+        handleClick(mc, p, p.containerMenu.containerId, slot, button, ci);
+        return "{\"ok\":true}";
+    }
+
+    // ---------------------------------------------------------------- поиск пути (A*)
+
+    private static boolean passable(Level level, BlockPos pos) {
+        BlockState st = level.getBlockState(pos);
+        if (st.isAir()) return true;
+        if (!st.getFluidState().isEmpty()) return false;
+        return st.getCollisionShape(level, pos).isEmpty() && !dangerous(blockId(st));
+    }
+
+    private static boolean dangerous(String id) {
+        return id.contains("lava") || id.contains("fire") || id.contains("cactus") || id.contains("berry_bush")
+                || id.contains("magma") || id.contains("campfire") || id.contains("cobweb") || id.contains("powder_snow");
+    }
+
+    private static boolean solidFloor(Level level, BlockPos pos) {
+        BlockState st = level.getBlockState(pos);
+        if (st.isAir() || !st.getFluidState().isEmpty()) return false;
+        return !st.getCollisionShape(level, pos).isEmpty() && !dangerous(blockId(st));
+    }
+
+    /** Можно ли стоять ногами в этой клетке. */
+    private static boolean standable(Level level, BlockPos feet) {
+        return passable(level, feet) && passable(level, feet.above()) && solidFloor(level, feet.below());
+    }
+
+    private record Node(BlockPos pos, double g, double f, Node parent) {}
+
+    /** A* по клеткам, где стоят ноги: шаг, подъём на 1, спуск до 4. Возвращает путь или null. */
+    private static List<BlockPos> findPath(Level level, BlockPos start, BlockPos goal, int maxNodes) {
+        java.util.PriorityQueue<Node> open = new java.util.PriorityQueue<>((a, b) -> Double.compare(a.f(), b.f()));
+        Map<BlockPos, Double> best = new HashMap<>();
+        open.add(new Node(start, 0, heuristic(start, goal), null));
+        best.put(start, 0.0);
+        Node closest = null;
+        double closestH = Double.MAX_VALUE;
+        int expanded = 0;
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        while (!open.isEmpty() && expanded < maxNodes) {
+            Node cur = open.poll();
+            if (cur.g() > best.getOrDefault(cur.pos(), Double.MAX_VALUE)) continue;
+            expanded++;
+            double h = heuristic(cur.pos(), goal);
+            if (h < closestH) { closestH = h; closest = cur; }
+            if (cur.pos().getX() == goal.getX() && cur.pos().getZ() == goal.getZ() && Math.abs(cur.pos().getY() - goal.getY()) <= 1) {
+                return rebuild(cur);
+            }
+            for (int[] d : dirs) {
+                BlockPos side = cur.pos().offset(d[0], 0, d[1]);
+                if (Math.abs(side.getX() - start.getX()) > 80 || Math.abs(side.getZ() - start.getZ()) > 80) continue;
+                // ровно
+                if (standable(level, side)) {
+                    relax(open, best, cur, side, 1.0, goal);
+                    continue;
+                }
+                // подъём на 1 блок: над головой текущей клетки должно быть свободно
+                BlockPos up = side.above();
+                if (passable(level, cur.pos().above(2)) && standable(level, up) ) {
+                    relax(open, best, cur, up, 1.6, goal);
+                    continue;
+                }
+                // спуск: проходим сбоку и падаем до опоры
+                if (passable(level, side) && passable(level, side.above())) {
+                    for (int drop = 1; drop <= 4; drop++) {
+                        BlockPos lower = side.below(drop);
+                        if (!passable(level, lower)) break;
+                        if (standable(level, lower)) {
+                            relax(open, best, cur, lower, 1.0 + drop * 0.7, goal);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (closest != null && closestH <= 2.5) {
+            return rebuild(closest);
+        }
+        return null;
+    }
+
+    private static double heuristic(BlockPos a, BlockPos b) {
+        double dx = a.getX() - b.getX(), dz = a.getZ() - b.getZ(), dy = Math.abs(a.getY() - b.getY());
+        return Math.sqrt(dx * dx + dz * dz) + dy * 0.5;
+    }
+
+    private static void relax(java.util.PriorityQueue<Node> open, Map<BlockPos, Double> best, Node cur, BlockPos next, double cost, BlockPos goal) {
+        double g = cur.g() + cost;
+        if (g < best.getOrDefault(next, Double.MAX_VALUE)) {
+            best.put(next, g);
+            open.add(new Node(next, g, g + heuristic(next, goal), cur));
+        }
+    }
+
+    private static List<BlockPos> rebuild(Node end) {
+        List<BlockPos> out = new ArrayList<>();
+        for (Node n = end; n != null; n = n.parent()) out.add(0, n.pos());
+        return out;
     }
 
     /** Выполняет запрос в клиентском тике и отдаёт результат. */
@@ -170,9 +625,9 @@ public class AgentMod implements ClientModInitializer {
         });
         String result;
         try {
-            result = future.get(2, TimeUnit.SECONDS);
+            result = future.get(5, TimeUnit.SECONDS);
         } catch (Exception e) {
-            result = "{\"error\":\"игра не ответила вовремя\"}";
+            result = "{\"error\":\"игра не ответила вовремя (окно свёрнуто или экран загрузки?)\"}";
         }
         send(ex, 200, result);
     }
@@ -430,8 +885,9 @@ public class AgentMod implements ClientModInitializer {
         if (j == null) {
             return "{\"status\":\"idle\"}";
         }
-        return "{\"status\":\"" + j.status + "\",\"type\":\"" + j.type + "\""
-                + (j.error != null ? ",\"error\":\"" + escape(j.error) + "\"" : "") + "}";
+        return "{\"id\":" + j.id + ",\"status\":\"" + j.status + "\",\"type\":\"" + j.type + "\""
+                + (j.error != null ? ",\"error\":\"" + escape(j.error) + "\"" : "")
+                + (j.info != null ? ",\"info\":\"" + escape(j.info) + "\"" : "") + "}";
     }
 
     /** Выполняется каждый клиентский тик, пока есть задача. */
@@ -445,15 +901,15 @@ public class AgentMod implements ClientModInitializer {
             finish(j, "failed", "нет игрока в мире");
             return;
         }
-        if (System.currentTimeMillis() - j.startedMs > 30_000) {
-            releaseKeys(mc);
-            finish(j, "failed", "таймаут");
+        if (System.currentTimeMillis() - j.startedMs > j.timeoutMs) {
+            finish(j, "failed", "таймаут " + (j.timeoutMs / 1000) + " с");
             return;
         }
         switch (j.type) {
             case "break" -> tickBreak(mc, p, j);
             case "goto" -> tickGoto(mc, p, j);
             case "place" -> tickPlace(mc, p, j);
+            case "open" -> tickOpen(mc, p, j);
             default -> finish(j, "failed", "неизвестная задача");
         }
     }
@@ -469,7 +925,12 @@ public class AgentMod implements ClientModInitializer {
         o.keyAttack.setDown(false);
         o.keyUse.setDown(false);
         o.keyUp.setDown(false);
+        o.keyDown.setDown(false);
+        o.keyLeft.setDown(false);
+        o.keyRight.setDown(false);
         o.keyJump.setDown(false);
+        o.keySprint.setDown(false);
+        o.keyShift.setDown(false);
     }
 
     private static void lookAtPoint(LocalPlayer p, double tx, double ty, double tz) {
@@ -485,45 +946,127 @@ public class AgentMod implements ClientModInitializer {
 
     private static void tickBreak(Minecraft mc, LocalPlayer p, Job j) {
         BlockPos pos = new BlockPos(j.x, j.y, j.z);
-        if (mc.level.getBlockState(pos).isAir()) {
-            releaseKeys(mc);
+        BlockState st = mc.level.getBlockState(pos);
+        if (st.isAir()) {
             finish(j, "done", null);
             return;
         }
         double dist = Math.sqrt(p.distanceToSqr(j.x + 0.5, j.y + 0.5, j.z + 0.5));
         if (dist > 4.5) {
-            finish(j, "failed", "блок слишком далеко (" + round(dist) + " м), сначала /goto");
+            finish(j, "failed", "блок слишком далеко (" + round(dist) + " м), сначала goto");
             return;
         }
+        if (!j.toolChosen) {
+            p.getInventory().setSelectedSlot(bestToolSlot(p, st));
+            j.toolChosen = true;
+        }
         lookAtPoint(p, j.x + 0.5, j.y + 0.5, j.z + 0.5);
+        HitResult hr = mc.hitResult;
+        if (hr instanceof BlockHitResult bhr && hr.getType() == HitResult.Type.BLOCK && !bhr.getBlockPos().equals(pos)) {
+            j.occludedTicks++;
+            if (j.occludedTicks > 10) {
+                BlockPos o = bhr.getBlockPos();
+                finish(j, "failed", "блок закрыт другим блоком: " + shortId(blockId(mc.level.getBlockState(o)))
+                        + " на (" + o.getX() + "," + o.getY() + "," + o.getZ() + ")");
+                return;
+            }
+            mc.options.keyAttack.setDown(false);
+            return;
+        }
+        j.occludedTicks = 0;
         mc.options.keyAttack.setDown(true);
     }
 
     private static void tickGoto(Minecraft mc, LocalPlayer p, Job j) {
-        double tx = j.x + 0.5, tz = j.z + 0.5, ty = j.y;
-        double dx = tx - p.getX(), dz = tz - p.getZ(), dy = ty - p.getY();
-        double horiz = Math.sqrt(dx * dx + dz * dz);
-        // Цель достигнута: близко по горизонтали и по высоте (для падения допускаем до 2 блоков разницы).
-        if (horiz < 0.7 && Math.abs(dy) < 1.2) {
-            releaseKeys(mc);
-            mc.options.keySprint.setDown(false);
+        long now = System.currentTimeMillis();
+        if (j.path == null) {
+            BlockPos start = p.blockPosition();
+            BlockPos goal = new BlockPos(j.x, j.y, j.z);
+            List<BlockPos> path = findPath(mc.level, start, goal, 9000);
+            if (path == null) {
+                finish(j, "failed", "цель недостижима: нет пути по загруженным блокам (препятствие, вода, лава или далеко)");
+                return;
+            }
+            j.path = path;
+            j.idx = path.size() > 1 ? 1 : 0;
+            j.lastCheckMs = now;
+            j.lastX = p.getX();
+            j.lastZ = p.getZ();
+            BlockPos end = path.get(path.size() - 1);
+            j.info = (end.getX() == goal.getX() && end.getZ() == goal.getZ())
+                    ? "путь: " + path.size() + " клеток"
+                    : "дошли до ближайшей точки (" + end.getX() + "," + end.getY() + "," + end.getZ() + "), путь " + path.size();
+        }
+        if (j.idx >= j.path.size()) {
             finish(j, "done", null);
             return;
         }
-        // Поворот к цели и шаг вперёд. Вниз идём просто шагами: спрыгиваем с уступа сами.
+        BlockPos wp = j.path.get(j.idx);
+        double tx = wp.getX() + 0.5, tz = wp.getZ() + 0.5;
+        double dx = tx - p.getX(), dz = tz - p.getZ();
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        boolean last = j.idx == j.path.size() - 1;
+        if (horiz < (last ? 0.35 : 0.5) && Math.abs(p.getY() - wp.getY()) < 1.3) {
+            j.idx++;
+            if (j.idx >= j.path.size()) {
+                finish(j, "done", null);
+            }
+            return;
+        }
+        // проверка застревания раз в 1.5 с
+        if (now - j.lastCheckMs > 1500) {
+            double moved = Math.sqrt((p.getX() - j.lastX) * (p.getX() - j.lastX) + (p.getZ() - j.lastZ) * (p.getZ() - j.lastZ));
+            j.lastCheckMs = now;
+            j.lastX = p.getX();
+            j.lastZ = p.getZ();
+            if (moved < 0.2 && p.onGround()) {
+                j.replans++;
+                if (j.replans > 3) {
+                    finish(j, "failed", "застрял на (" + round(p.getX()) + "," + round(p.getY()) + "," + round(p.getZ()) + ")");
+                    return;
+                }
+                j.path = null;
+                releaseKeys(mc);
+                return;
+            }
+        }
         p.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
         p.setXRot(0f);
-        mc.options.keyUp.setDown(horiz > 0.5);
+        mc.options.keyUp.setDown(true);
         mc.options.keySprint.setDown(false);
-        // Прыжок: если впереди препятствие на уровне ног с местом над ним, или цель выше нас.
         boolean onGround = p.onGround();
         double sx = horiz > 0 ? p.getX() + dx / horiz * 0.9 : p.getX();
         double sz = horiz > 0 ? p.getZ() + dz / horiz * 0.9 : p.getZ();
-        BlockPos feet = BlockPos.containing(sx, p.getY(), sz);
-        boolean wall = !mc.level.getBlockState(feet).isAir() && mc.level.getBlockState(feet.above()).isAir();
-        boolean higher = dy > 0.8;
+        BlockPos ahead = BlockPos.containing(sx, p.getY(), sz);
+        boolean wall = !passable(mc.level, ahead) && passable(mc.level, ahead.above());
+        boolean higher = wp.getY() > p.getY() + 0.3;
         mc.options.keyJump.setDown(onGround && (wall || higher));
-        // Если уперлись в стену и не можем перепрыгнуть, даём задачу на 30 с и отчитаемся.
+    }
+
+    /** Открыть меню блока (верстак, печь, сундук) правой кнопкой и дождаться экрана. */
+    private static void tickOpen(Minecraft mc, LocalPlayer p, Job j) {
+        if (!(p.containerMenu instanceof InventoryMenu)) {
+            finish(j, "done", null);
+            return;
+        }
+        BlockPos pos = new BlockPos(j.x, j.y, j.z);
+        if (mc.level.getBlockState(pos).isAir()) {
+            finish(j, "failed", "в этой точке нет блока");
+            return;
+        }
+        double dist = Math.sqrt(p.distanceToSqr(j.x + 0.5, j.y + 0.5, j.z + 0.5));
+        if (dist > 4.5) {
+            finish(j, "failed", "блок слишком далеко (" + round(dist) + " м), сначала goto");
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - j.lastUseMs > 1000) {
+            j.lastUseMs = now;
+            lookAtPoint(p, j.x + 0.5, j.y + 0.5, j.z + 0.5);
+            Vec3 hit = new Vec3(j.x + 0.5, j.y + 0.5, j.z + 0.5);
+            BlockHitResult bhr = new BlockHitResult(hit, Direction.UP, pos, false);
+            mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, bhr);
+        }
     }
 
     private static void tickPlace(Minecraft mc, LocalPlayer p, Job j) {
