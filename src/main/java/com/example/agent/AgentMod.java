@@ -71,6 +71,7 @@ public class AgentMod implements ClientModInitializer {
         // состояние break и open
         int occludedTicks = 0;
         boolean toolChosen = false;
+        boolean destroyStarted = false;
         long lastUseMs = 0;
         Job(String type, int x, int y, int z) {
             this.type = type; this.x = x; this.y = y; this.z = z;
@@ -1002,7 +1003,42 @@ public class AgentMod implements ClientModInitializer {
             return;
         }
         j.occludedTicks = 0;
-        mc.options.keyAttack.setDown(true);
+        Direction face = (hr instanceof BlockHitResult hb && hr.getType() == HitResult.Type.BLOCK) ? hb.getDirection() : Direction.UP;
+        if (!destroyDirect(mc, p, pos, face, j)) {
+            // запасной путь: клавиша атаки (работает только при активном окне игры)
+            mc.options.keyAttack.setDown(true);
+        }
+    }
+
+    private static java.lang.reflect.Method destroyStart = null;
+    private static java.lang.reflect.Method destroyContinue = null;
+    private static boolean destroyLookupDone = false;
+
+    /** Ломает блок напрямую через MultiPlayerGameMode, не завися от фокуса окна. Возвращает false, если методов нет. */
+    private static boolean destroyDirect(Minecraft mc, LocalPlayer p, BlockPos pos, Direction face, Job j) {
+        try {
+            if (!destroyLookupDone) {
+                destroyLookupDone = true;
+                Class<?> gm = mc.gameMode.getClass();
+                destroyStart = gm.getMethod("startDestroyBlock", BlockPos.class, Direction.class);
+                destroyContinue = gm.getMethod("continueDestroyBlock", BlockPos.class, Direction.class);
+            }
+            if (destroyStart == null || destroyContinue == null) return false;
+            mc.options.keyAttack.setDown(false);
+            if (!j.destroyStarted) {
+                destroyStart.invoke(mc.gameMode, pos, face);
+                j.destroyStarted = true;
+            } else {
+                destroyContinue.invoke(mc.gameMode, pos, face);
+            }
+            p.swing(InteractionHand.MAIN_HAND);
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            destroyStart = null;
+            destroyContinue = null;
+            System.err.println("[agent] прямой слом блока недоступен: " + e);
+            return false;
+        }
     }
 
     private static void tickGoto(Minecraft mc, LocalPlayer p, Job j) {
