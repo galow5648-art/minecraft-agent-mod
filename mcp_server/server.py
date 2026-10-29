@@ -426,19 +426,24 @@ def collect(r=8):
 OCCLUDER = re.compile(r"\((-?\d+),(-?\d+),(-?\d+)\)")
 
 
-def brk_clear(x, y, z, log=None, stops=None):
-    """Сломать блок; если его закрывает другой блок, убрать закрывающий и повторить."""
+def brk_clear(x, y, z, log=None, stops=None, depth=0):
+    """Сломать блок; если его закрывает другой блок, рекурсивно убрать цепочку закрывающих и повторить.
+    Луч от глаз к цели может пройти через несколько блоков подряд (диагональ вверх/вниз), поэтому
+    помеху нужно ломать тем же brk_clear, а не одним brk."""
     res = {"status": "failed", "error": "не удалось сломать"}
-    for _ in range(4):
+    for _ in range(6):
         res = brk(x, y, z, stops)
         if res.get("status") == "done":
             return res
-        m = OCCLUDER.search(res.get("error") or "")
-        if "закрыт" in (res.get("error") or "") and m:
+        err = res.get("error") or ""
+        m = OCCLUDER.search(err)
+        if "закрыт" in err and m and depth < 5:
             ox, oy, oz = map(int, m.groups())
+            if (ox, oy, oz) == (int(x), int(y), int(z)):
+                return res
             if log is not None:
                 log.append(f"убираю мешающий блок ({ox},{oy},{oz})")
-            r2 = brk(ox, oy, oz, stops)
+            r2 = brk_clear(ox, oy, oz, log, stops, depth + 1)
             if r2.get("status") != "done":
                 return r2
             continue
@@ -452,18 +457,10 @@ def break_with_retry(t, log):
     if res.get("status") != "done":
         return {"status": "failed", "error": "не дойти: " + str(res.get("error"))}
     for _ in range(4):
-        res = brk(t["x"], t["y"], t["z"])
+        res = brk_clear(t["x"], t["y"], t["z"], log)
         if res.get("status") == "done":
             return res
         err = res.get("error") or ""
-        m = OCCLUDER.search(err)
-        if "закрыт" in err and m:
-            ox, oy, oz = map(int, m.groups())
-            log.append(f"убираю мешающий блок ({ox},{oy},{oz})")
-            r2 = brk(ox, oy, oz)
-            if r2.get("status") != "done":
-                return r2
-            continue
         if "далеко" in err:
             g = goto(t["x"], t["y"], t["z"])
             if g.get("status") != "done":
