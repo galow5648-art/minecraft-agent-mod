@@ -1,0 +1,6 @@
+-proc:none
+-Xmaxerrs
+5000
+-d
+/tmp/claude-0/jc
+src/main/java/com/example/agent/AgentMod.java

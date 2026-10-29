@@ -704,6 +704,15 @@ public class AgentMod implements ClientModInitializer {
         throw new NoSuchMethodException(target.getClass().getName() + "." + name + "/" + args.length);
     }
 
+    /** Анимация замаха: только визуальная; сигнатура swing менялась между версиями, поэтому через рефлексию. */
+    private static void swingHand(LocalPlayer p) {
+        try {
+            call(p, "swing", InteractionHand.MAIN_HAND);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // замах не нужен для работы пакетов атаки и использования
+        }
+    }
+
     private static boolean flag(String json, String name) {
         return json.contains("\"" + name + "\":true") || json.contains("\"" + name + "\": true");
     }
@@ -853,7 +862,7 @@ public class AgentMod implements ClientModInitializer {
         if (p.getAttackStrengthScale(0.5f) >= 0.95f) {
             try {
                 call(mc.gameMode, "attack", p, e);
-                p.swing(InteractionHand.MAIN_HAND);
+                swingHand(p);
                 j.hitsDone++;
             } catch (ReflectiveOperationException | RuntimeException ex) {
                 finish(j, "failed", "атака недоступна: " + ex);
@@ -918,7 +927,7 @@ public class AgentMod implements ClientModInitializer {
         try {
             BlockHitResult bhr = new BlockHitResult(new Vec3(cx, cy, cz), f, pos, false);
             Object r = call(mc.gameMode, "useItemOn", p, InteractionHand.MAIN_HAND, bhr);
-            p.swing(InteractionHand.MAIN_HAND);
+            swingHand(p);
             return "{\"ok\":true,\"result\":\"" + escape(String.valueOf(r)) + "\",\"block\":\"" + escape(shortId(blockId(mc.level.getBlockState(pos)))) + "\"}";
         } catch (ReflectiveOperationException | RuntimeException e) {
             return "{\"ok\":false,\"error\":\"" + escape(String.valueOf(e)) + "\"}";
@@ -936,7 +945,7 @@ public class AgentMod implements ClientModInitializer {
         lookAtPoint(p, e.getX(), e.getY() + e.getBbHeight() * 0.6, e.getZ());
         try {
             Object r = call(mc.gameMode, "interact", p, e, InteractionHand.MAIN_HAND);
-            p.swing(InteractionHand.MAIN_HAND);
+            swingHand(p);
             return "{\"ok\":true,\"result\":\"" + escape(String.valueOf(r)) + "\"}";
         } catch (ReflectiveOperationException | RuntimeException ex) {
             return "{\"ok\":false,\"error\":\"" + escape(String.valueOf(ex)) + "\"}";
@@ -1495,7 +1504,7 @@ public class AgentMod implements ClientModInitializer {
             } else {
                 destroyContinue.invoke(mc.gameMode, pos, face);
             }
-            p.swing(InteractionHand.MAIN_HAND);
+            swingHand(p);
             return true;
         } catch (ReflectiveOperationException | RuntimeException e) {
             destroyStart = null;
@@ -1624,7 +1633,7 @@ public class AgentMod implements ClientModInitializer {
             Vec3 hit = new Vec3(cx, cy, cz);
             BlockHitResult bhr = new BlockHitResult(hit, j.face, target, false);
             mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, bhr);
-            p.swing(InteractionHand.MAIN_HAND);
+            swingHand(p);
             j.placeTicks = 1;
             return;
         }
