@@ -732,13 +732,6 @@ public class AgentMod implements ClientModInitializer {
                 sb.append("## MISSING ").append(name).append('\n');
             }
         }
-        try {
-            Minecraft mc = Minecraft.getInstance();
-            Object book = mc.player == null ? null : mc.getConnection().getRecipeBook();
-            sb.append("## book obj: ").append(book == null ? "null" : book.getClass().getName()).append('\n');
-        } catch (RuntimeException e) {
-            sb.append("## book error: ").append(e).append('\n');
-        }
         return sb.toString();
     }
 
