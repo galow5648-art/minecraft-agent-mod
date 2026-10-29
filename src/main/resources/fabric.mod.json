@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "minecraft-agent",
+  "version": "${version}",
+  "name": "Minecraft Agent",
+  "description": "Локальный API для управления персонажем ИИ-агентом в одиночной игре.",
+  "authors": ["galow5648-art"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.example.agent.AgentMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "minecraft": "26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
