@@ -27,6 +27,8 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.CraftingMenu;
+import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.InteractionHand;
@@ -275,8 +277,17 @@ public class AgentMod implements ClientModInitializer {
             return "{\"ok\":false,\"error\":\"нет шаблона рецепта для " + escape(itemId) + "\"}";
         }
         AbstractContainerMenu menu = p.containerMenu;
-        int w = menu.getGridWidth();
-        int h = menu.getGridHeight();
+        int w;
+        int h;
+        if (menu instanceof CraftingMenu cm) {
+            w = cm.getGridWidth();
+            h = cm.getGridHeight();
+        } else if (menu instanceof InventoryMenu im) {
+            w = im.getGridWidth();
+            h = im.getGridHeight();
+        } else {
+            return "{\"ok\":false,\"error\":\"открытый экран не поддерживает крафт\"}";
+        }
         int rh = rec.rows().length;
         int rw = rec.rows()[0].length();
         if (rw > w || rh > h) {
