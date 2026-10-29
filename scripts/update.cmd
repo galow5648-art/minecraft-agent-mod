@@ -92,6 +92,8 @@ if errorlevel 1 exit /b 1
 
 echo Updating the MCP server...
 if not exist "C:\MinecraftAgent" mkdir "C:\MinecraftAgent"
+copy /y "%PROJ%\mcp_server\agent_core.py" "C:\MinecraftAgent\agent_core.py" >nul
+if errorlevel 1 exit /b 1
 copy /y "%PROJ%\mcp_server\server.py" "%SERVER_DST%" >nul
 if errorlevel 1 exit /b 1
 > "%STATE%\version.txt" echo !LATEST_SHA!
