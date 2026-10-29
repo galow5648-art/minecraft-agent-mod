@@ -29,7 +29,7 @@ TOOLS = [
     },
     {
         "name": "minecraft_use_item",
-        "description": "Использовать предмет в руке (правая кнопка по воздуху): съесть еду, бросить жемчуг/глаз Эндера/снежок, вылить или набрать ведро, натянуть лук. slot (0–8) или item (сам положит в хотбар). hold_ticks — сколько держать (еда доедается сама, лук: hold_ticks≈20 и release=true). Возвращает изменения инвентаря, здоровья и голода.",
+        "description": "Использовать предмет в руке (правая кнопка по воздуху): съесть еду, бросить жемчуг/глаз Эндера/снежок, вылить или набрать ведро, натянуть лук. slot (0–8) или item (сам положит в хотбар). hold_ticks — сколько держать (еда доедается сама, лук: hold_ticks около 20 и release=true). Возвращает изменения инвентаря, здоровья и голода.",
         "inputSchema": {"type": "object", "properties": {"slot": {"type": "integer", "minimum": 0, "maximum": 8}, "item": {"type": "string"}, "hold_ticks": {"type": "integer", "minimum": 0, "maximum": 400}, "release": {"type": "boolean"}}},
     },
     {
@@ -956,7 +956,8 @@ def reply(msg_id, result=None, error=None):
         msg["error"] = error
     else:
         msg["result"] = result
-    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    # ensure_ascii=True: вывод чисто ASCII, не зависит от кодовой страницы консоли Windows (cp1251/charmap)
+    sys.stdout.write(json.dumps(msg, ensure_ascii=True) + "\n")
     sys.stdout.flush()
 
 
@@ -988,14 +989,32 @@ def handle(req):
 
 
 def main():
+    # На Windows stdio по умолчанию в cp1251/charmap: принудительно UTF-8 (русский текст в запросах и ошибках)
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
+        req = None
         try:
-            handle(json.loads(line))
+            req = json.loads(line)
+            handle(req)
         except Exception as e:
-            sys.stderr.write(f"[minecraft-agent] ошибка: {e}\n")
+            try:
+                sys.stderr.write(f"[minecraft-agent] ошибка: {e}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            # не оставляем клиента без ответа
+            if isinstance(req, dict) and req.get("id") is not None:
+                try:
+                    reply(req["id"], error={"code": -32603, "message": str(e)})
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
