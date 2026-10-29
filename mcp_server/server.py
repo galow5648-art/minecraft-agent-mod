@@ -486,7 +486,8 @@ def dig_to(x, y, z, max_steps=60):
             return {"status": "done", "steps": step, "notes": notes}
         # следующая клетка для ног
         if abs(dx) + abs(dz) == 0:
-            nx, nz = cx, cz
+            # строго вверх без опоры не поднимешься: идём лесенкой, шаг в сторону
+            nx, nz = (cx + 1, cz) if dy > 0 else (cx, cz)
         elif abs(dx) >= abs(dz):
             nx, nz = cx + (1 if dx > 0 else -1), cz
         else:
@@ -739,6 +740,20 @@ def place(x, y, z, item=None, face="up", stops=None):
 
 # ------------------------------------------------------------------ наблюдение за последствиями
 
+WEAPON_ORDER = ["netherite_sword", "diamond_sword", "iron_sword", "stone_sword", "golden_sword", "wooden_sword",
+                "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "golden_axe", "wooden_axe"]
+
+
+def equip_best_weapon():
+    """Взять в руку лучший меч/топор из инвентаря. Возвращает короткое имя или None."""
+    counts = inv_counts()
+    for w in WEAPON_ORDER:
+        if counts.get("minecraft:" + w, 0) > 0:
+            if ensure_hotbar(w) is not None:
+                return w
+    return None
+
+
 def snapshot():
     st = api("GET", "/state")
     return {"inv": inv_counts(), "hp": st.get("health"), "food": st.get("food")}
@@ -902,6 +917,7 @@ def run_tool(name, args):
     if name == "minecraft_attack":
         payload = {"id": int(args["id"]), "hits": int(args.get("hits", 1)), "chase": bool(args.get("chase", True))}
         payload.update(stops_of(args))
+        equip_best_weapon()
         return observed(lambda: run_job("/attack", payload))
     if name == "minecraft_use_item":
         payload = {"hold_ticks": int(args.get("hold_ticks", 0)), "release": bool(args.get("release", False))}
