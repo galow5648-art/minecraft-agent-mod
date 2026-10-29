@@ -593,6 +593,7 @@ def with_station(kind, fn):
     o = open_block(st["x"], st["y"], st["z"])
     if o.get("status") != "done":
         return {"ok": False, "error": f"не открыть {kind}: {o.get('error')}"}
+    time.sleep(0.4)  # меню должно полностью открыться до первого клика
     try:
         return fn()
     finally:
@@ -617,6 +618,7 @@ def craft_item(item, count=1):
             else:
                 r = api("POST", "/craft", {"item": item, "times": 1})
             last_err = r.get("error")
+            time.sleep(0.4)  # даём меню/инвентарю синхронизироваться с сервером
             if count_of(inv_counts(), item) - before == have:
                 stalled += 1
                 if stalled >= 2:
