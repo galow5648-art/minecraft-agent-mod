@@ -112,6 +112,7 @@ public class AgentMod implements ClientModInitializer {
             server.createContext("/job", ex -> send(ex, 200, jobJson()));
             server.createContext("/debug_api", ex -> send(ex, 200, dumpApi()));
             server.createContext("/debug_recipes", ex -> send(ex, 200, dumpRecipes()));
+            server.createContext("/debug_sync", ex -> respondFromGame(ex, AgentMod::dumpSync));
             server.createContext("/entities", ex -> {
                 int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
                 respondFromGame(ex, () -> entities(r));
@@ -490,21 +491,30 @@ public class AgentMod implements ClientModInitializer {
     }
 
     private static void tickGoto(Minecraft mc, LocalPlayer p, Job j) {
-        double tx = j.x + 0.5, tz = j.z + 0.5;
-        double dx = tx - p.getX(), dz = tz - p.getZ();
+        double tx = j.x + 0.5, tz = j.z + 0.5, ty = j.y;
+        double dx = tx - p.getX(), dz = tz - p.getZ(), dy = ty - p.getY();
         double horiz = Math.sqrt(dx * dx + dz * dz);
-        if (horiz < 0.6) {
+        // Цель достигнута: близко по горизонтали и по высоте (для падения допускаем до 2 блоков разницы).
+        if (horiz < 0.7 && Math.abs(dy) < 1.2) {
             releaseKeys(mc);
+            mc.options.keySprint.setDown(false);
             finish(j, "done", null);
             return;
         }
+        // Поворот к цели и шаг вперёд. Вниз идём просто шагами: спрыгиваем с уступа сами.
         p.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
-        mc.options.keyUp.setDown(true);
-        // Прыжок, если впереди блок на уровне ног, а над ним есть место.
-        BlockPos ahead = BlockPos.containing(p.getX() + dx / horiz * 0.8, p.getY(), p.getZ() + dz / horiz * 0.8);
-        boolean wallAhead = !mc.level.getBlockState(ahead).isAir();
-        boolean headFree = mc.level.getBlockState(ahead.above()).isAir();
-        mc.options.keyJump.setDown(p.onGround() && wallAhead && headFree);
+        p.setXRot(0f);
+        mc.options.keyUp.setDown(horiz > 0.5);
+        mc.options.keySprint.setDown(false);
+        // Прыжок: если впереди препятствие на уровне ног с местом над ним, или цель выше нас.
+        boolean onGround = p.onGround();
+        double sx = horiz > 0 ? p.getX() + dx / horiz * 0.9 : p.getX();
+        double sz = horiz > 0 ? p.getZ() + dz / horiz * 0.9 : p.getZ();
+        BlockPos feet = BlockPos.containing(sx, p.getY(), sz);
+        boolean wall = !mc.level.getBlockState(feet).isAir() && mc.level.getBlockState(feet.above()).isAir();
+        boolean higher = dy > 0.8;
+        mc.options.keyJump.setDown(onGround && (wall || higher));
+        // Если уперлись в стену и не можем перепрыгнуть, даём задачу на 30 с и отчитаемся.
     }
 
     private static void tickPlace(Minecraft mc, LocalPlayer p, Job j) {
@@ -641,6 +651,66 @@ public class AgentMod implements ClientModInitializer {
             }
         }
         return sb.toString();
+    }
+
+    /** Служебный дамп: SynchronizedRecipes и клиентская книга рецептов (рефлексия, без жёстких имён). */
+    private static String dumpSync() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            Object acc = mc.getConnection().recipes();
+            Object sync = acc.getClass().getMethod("getSynchronizedRecipes").invoke(acc);
+            sb.append("## SynchronizedRecipes impl: ").append(sync == null ? "null" : sync.getClass().getName()).append('\n');
+            if (sync != null) {
+                dumpClass(sb, sync.getClass());
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            sb.append("## SynchronizedRecipes error: ").append(e).append('\n');
+        }
+        try {
+            Object conn = Minecraft.getInstance().getConnection();
+            for (java.lang.reflect.Field f : conn.getClass().getDeclaredFields()) {
+                String t = f.getType().getName();
+                if (t.toLowerCase(java.util.Locale.ROOT).contains("recipe")) {
+                    sb.append("## connection field: ").append(f.getName()).append(" : ").append(t).append('\n');
+                }
+            }
+            Minecraft mc = Minecraft.getInstance();
+            for (java.lang.reflect.Field f : mc.getClass().getDeclaredFields()) {
+                String t = f.getType().getName();
+                if (t.toLowerCase(java.util.Locale.ROOT).contains("recipe")) {
+                    sb.append("## minecraft field: ").append(f.getName()).append(" : ").append(t).append('\n');
+                }
+            }
+        } catch (RuntimeException e) {
+            sb.append("## fields error: ").append(e).append('\n');
+        }
+        for (String name : new String[]{
+                "net.minecraft.client.ClientRecipeBook",
+                "net.minecraft.client.gui.screens.recipebook.RecipeBookComponent",
+                "net.minecraft.world.item.crafting.SelectableRecipe",
+                "net.minecraft.world.item.crafting.RecipePropertySet"}) {
+            try {
+                sb.append("## ").append(name).append('\n');
+                dumpClass(sb, Class.forName(name));
+            } catch (ClassNotFoundException | LinkageError e) {
+                sb.append("## MISSING ").append(name).append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void dumpClass(StringBuilder sb, Class<?> c) {
+        for (java.lang.reflect.Method m : c.getMethods()) {
+            if (m.getDeclaringClass() == Object.class) continue;
+            sb.append("  ").append(m.getReturnType().getName()).append(' ').append(m.getName()).append('(');
+            Class<?>[] ps = m.getParameterTypes();
+            for (int i = 0; i < ps.length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(ps[i].getName());
+            }
+            sb.append(")\n");
+        }
     }
 
     private static String blockId(BlockState st) {

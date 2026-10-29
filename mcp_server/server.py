@@ -14,6 +14,11 @@ KEY_ACTIONS = ["forward", "back", "left", "right", "jump", "sneak", "sprint", "a
 
 TOOLS = [
     {
+        "name": "minecraft_debug_sync",
+        "description": "Служебный: дамп SynchronizedRecipes и книги рецептов (для поиска списка всех рецептов).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "minecraft_debug_recipes",
         "description": "Служебный: клиентский доступ к рецептам и классы отображения результатов (дамп API).",
         "inputSchema": {"type": "object", "properties": {}},
@@ -193,6 +198,8 @@ def situation(radius=8):
 
 
 def run_tool(name, args):
+    if name == "minecraft_debug_sync":
+        return call_api("GET", "/debug_sync")
     if name == "minecraft_debug_recipes":
         return call_api("GET", "/debug_recipes")
     if name == "minecraft_debug_api":
