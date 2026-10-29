@@ -244,7 +244,6 @@ public class AgentMod implements ClientModInitializer {
         if (p == null || mc.level == null) {
             return "{\"ok\":false,\"error\":\"нет игрока в мире\"}";
         }
-        var recipeHolder = (var h) -> h;
         for (var holder : mc.level.getRecipeManager().getRecipes()) {
             if (!(holder.value() instanceof CraftingRecipe)) continue;
             ItemStack result = holder.value().getResultItem(mc.level.registryAccess());
