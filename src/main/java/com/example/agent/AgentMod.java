@@ -27,8 +27,6 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Monster;
-import net.minecraft.world.inventory.ClickType;
-import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.core.Direction;
@@ -237,27 +235,9 @@ public class AgentMod implements ClientModInitializer {
         return sb.toString();
     }
 
-    /** Крафт по рецепту из книги рецептов игры. Ингредиенты должны быть в инвентаре. */
+    /** Крафт пока не подключён: API рецептов для Minecraft 26.3 ещё не проверен. */
     private static String craft(String itemId, int times) {
-        Minecraft mc = Minecraft.getInstance();
-        LocalPlayer p = mc.player;
-        if (p == null || mc.level == null) {
-            return "{\"ok\":false,\"error\":\"нет игрока в мире\"}";
-        }
-        for (var holder : mc.level.getRecipeManager().getRecipes()) {
-            if (!(holder.value() instanceof CraftingRecipe)) continue;
-            ItemStack result = holder.value().getResultItem(mc.level.registryAccess());
-            if (!String.valueOf(BuiltInRegistries.ITEM.getKey(result.getItem())).equals(itemId)) continue;
-            int menuId = p.containerMenu.containerId;
-            int crafted = 0;
-            for (int i = 0; i < times; i++) {
-                mc.gameMode.handlePlaceRecipe(menuId, holder, false);
-                mc.gameMode.handleInventoryMouseClick(menuId, 0, 0, ClickType.QUICK_MOVE, p);
-                crafted++;
-            }
-            return "{\"ok\":true,\"crafted\":" + crafted + ",\"item\":\"" + escape(itemId) + "\"}";
-        }
-        return "{\"ok\":false,\"error\":\"рецепт не найден или не в книге рецептов: " + escape(itemId) + "\"}";
+        return "{\"ok\":false,\"error\":\"крафт пока не реализован в этой версии мода\",\"item\":\"" + escape(itemId) + "\"}";
     }
 
     private static String lookAt() {
