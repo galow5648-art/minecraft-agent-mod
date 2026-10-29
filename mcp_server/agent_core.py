@@ -827,7 +827,12 @@ def craft_item(item, count=1):
                 r = api("POST", "/craft", {"item": item, "times": 1})
             last_err = r.get("error")
             time.sleep(0.4)  # даём меню/инвентарю синхронизироваться с сервером
-            if count_of(inv_counts(), item) - before == have:
+            now = inv_counts()
+            wrong = [short(i) for i, c in now.items()
+                     if c > inv_before.get(i, 0) and i != item and short(i).endswith(("_trapdoor", "_table", "_door", "_button"))]
+            if wrong:  # скрафтилось постороннее: индекс рецепта сбился — не повторяем, чтобы не сжечь ресурсы
+                return False, f"скрафтилось не то ({', '.join(wrong)}): индекс рецепта сбился, остановлено"
+            if count_of(now, item) - before == have:
                 stalled += 1
                 if stalled >= 2:
                     return False, last_err or "ингредиентов не хватает или нужен верстак"
@@ -835,7 +840,13 @@ def craft_item(item, count=1):
                 stalled = 0
         return count_of(inv_counts(), item) - before >= count, last_err
 
-    ok, err = attempt_loop()
+    # то, что не помещается в сетку 2x2, сразу делаем у верстака: в инвентаре индексы рецептов уводят в чужие предметы
+    needs_table = short(item).endswith(("_helmet", "_chestplate", "_leggings", "_boots", "_pickaxe", "_axe",
+                                        "_shovel", "_hoe", "_sword", "shield", "bucket", "furnace", "_bed"))
+    if needs_table:
+        ok, err = False, None
+    else:
+        ok, err = attempt_loop()
     via = "инвентарь"
     if not ok:
         via = "верстак"
