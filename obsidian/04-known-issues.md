@@ -9,3 +9,5 @@
 - Листва в кроне: сложно спуститься к земле через `/goto` без `break`.
 - Сборка не проверяется в облаке: Maven недоступен. Ошибки компиляции видны только после `build.bat`.
 - MCP-сервер и мод обновляются вместе через `update.cmd`; без перезапуска приложения Claude новые инструменты не видны.
+- Пакет «инструменты» (attack, use_item, interact_*, block_info, alerts, chat, respawn, stop_if, place с гранью) написан без сборки. Вызовы gameMode.attack/interact/useItem/releaseUsingItem, getDayTime, getMaxLocalRawBrightness идут через рефлексию: если метода нет, инструмент вернёт понятную ошибку, а не уронит мод.
+- Слом блока идёт напрямую через startDestroyBlock/continueDestroyBlock (не зависит от фокуса окна); клавиша атаки только запасной путь.

@@ -72,10 +72,26 @@ public class AgentMod implements ClientModInitializer {
         int occludedTicks = 0;
         boolean toolChosen = false;
         boolean destroyStarted = false;
+        // условия остановки, которые задаёт вызывающий (<=0 — выключено)
+        double stopHealth = -1;
+        double stopHostile = -1;
+        // place
+        Direction face = Direction.UP;
+        int placeTicks = 0;
+        // attack
+        int entityId = -1;
+        int hitsWanted = 1;
+        int hitsDone = 0;
+        boolean chase = true;
+        // use
+        int slot = -1;
+        int holdTicks = 0;
+        int ticks = 0;
+        boolean release = false;
         long lastUseMs = 0;
         Job(String type, int x, int y, int z) {
             this.type = type; this.x = x; this.y = y; this.z = z;
-            this.timeoutMs = switch (type) { case "goto" -> 90_000; case "break" -> 25_000; case "place" -> 5_000; default -> 30_000; };
+            this.timeoutMs = switch (type) { case "goto" -> 90_000; case "break" -> 25_000; case "place" -> 5_000; case "attack" -> 40_000; case "use" -> 15_000; default -> 30_000; };
         }
     }
     private static volatile boolean focusFixed = false;
@@ -93,6 +109,7 @@ public class AgentMod implements ClientModInitializer {
                 }
             }
             fixFocus(mc);
+            collectEvents(mc);
             tickJob(mc);
             lastState = buildState(mc);
         });
@@ -161,21 +178,87 @@ public class AgentMod implements ClientModInitializer {
             route(server, "/break", ex -> {
                 String b = read(ex);
                 int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
-                startJob(new Job("break", x, y, z));
+                startJob(applyStops(new Job("break", x, y, z), b));
                 send(ex, 200, "{\"ok\":true}");
             });
             route(server, "/goto", ex -> {
                 String b = read(ex);
                 int x = (int) Math.floor(num(b, "x")), y = (int) num(b, "y"), z = (int) Math.floor(num(b, "z"));
-                startJob(new Job("goto", x, y, z));
+                if (flag(b, "any_y")) y = -9999;
+                startJob(applyStops(new Job("goto", x, y, z), b));
                 send(ex, 200, "{\"ok\":true}");
             });
             route(server, "/place", ex -> {
                 String b = read(ex);
                 int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
-                startJob(new Job("place", x, y, z));
+                Job pj = applyStops(new Job("place", x, y, z), b);
+                pj.face = faceOf(field(b, "face"));
+                startJob(pj);
                 send(ex, 200, "{\"ok\":true}");
             });
+            route(server, "/entities_all", ex -> {
+                int r = clamp((int) queryNum(ex, "r", 16), 1, 48);
+                respondFromGame(ex, () -> entitiesAll(r));
+            });
+            route(server, "/attack", ex -> {
+                String b = read(ex);
+                Job aj = applyStops(new Job("attack", 0, 0, 0), b);
+                aj.entityId = (int) num(b, "id");
+                aj.hitsWanted = Math.max(1, Math.min(60, (int) num(b, "hits")));
+                aj.chase = !b.contains("\"chase\":false") && !b.contains("\"chase\": false");
+                startJob(aj);
+                send(ex, 200, "{\"ok\":true}");
+            });
+            route(server, "/use_item", ex -> {
+                String b = read(ex);
+                Job uj = applyStops(new Job("use", 0, 0, 0), b);
+                uj.slot = b.contains("\"slot\"") ? (int) num(b, "slot") : -1;
+                uj.holdTicks = Math.max(0, Math.min(400, (int) num(b, "hold_ticks")));
+                uj.release = flag(b, "release");
+                startJob(uj);
+                send(ex, 200, "{\"ok\":true}");
+            });
+            route(server, "/interact_block", ex -> {
+                String b = read(ex);
+                int x = (int) num(b, "x"), y = (int) num(b, "y"), z = (int) num(b, "z");
+                Direction f = faceOf(field(b, "face"));
+                boolean sneak = flag(b, "sneak");
+                respondFromGame(ex, () -> interactBlock(x, y, z, f, sneak));
+            });
+            route(server, "/interact_entity", ex -> {
+                int id = (int) num(read(ex), "id");
+                respondFromGame(ex, () -> interactEntity(id));
+            });
+            route(server, "/block_info", ex -> {
+                int x = (int) queryNum(ex, "x", 0), y = (int) queryNum(ex, "y", 0), z = (int) queryNum(ex, "z", 0);
+                respondFromGame(ex, () -> blockInfo(x, y, z));
+            });
+            route(server, "/alerts", ex -> {
+                StringBuilder sb = new StringBuilder("{\"events\":[");
+                synchronized (EVENTS) {
+                    for (int i = 0; i < EVENTS.size(); i++) {
+                        if (i > 0) sb.append(',');
+                        sb.append('"').append(escape(EVENTS.get(i))).append('"');
+                    }
+                    EVENTS.clear();
+                }
+                sb.append("]}");
+                send(ex, 200, sb.toString());
+            });
+            route(server, "/chat", ex -> {
+                String text = field(read(ex), "text");
+                respondFromGame(ex, () -> chat(text));
+            });
+            route(server, "/respawn", ex -> respondFromGame(ex, () -> {
+                LocalPlayer rp = Minecraft.getInstance().player;
+                if (rp == null) return "{\"ok\":false}";
+                try {
+                    call(rp, "respawn");
+                    return "{\"ok\":true}";
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    return "{\"ok\":false,\"error\":\"" + escape(String.valueOf(e)) + "\"}";
+                }
+            }));
             route(server, "/status", ex -> respondFromGame(ex, AgentMod::status));
             route(server, "/cancel", ex -> {
                 Job j = job;
@@ -319,6 +402,55 @@ public class AgentMod implements ClientModInitializer {
         return scr == null ? "null" : "\"" + escape(scr.getClass().getSimpleName()) + "\"";
     }
 
+    /** Время суток, свет, эффекты, броня, опыт: данные для решений модели. Каждое поле необязательное. */
+    private static String statusExtra(Minecraft mc, LocalPlayer p) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            long t = (Long) call(mc.level, "getDayTime");
+            long tod = ((t % 24000) + 24000) % 24000;
+            sb.append(",\"time_of_day\":").append(tod).append(",\"is_night\":").append(tod >= 13000 && tod <= 23000);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // нет метода
+        }
+        try {
+            sb.append(",\"light\":").append(call(mc.level, "getMaxLocalRawBrightness", p.blockPosition()));
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // нет метода
+        }
+        try {
+            sb.append(",\"raining\":").append(call(mc.level, "isRaining"));
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // нет метода
+        }
+        sb.append(",\"on_ground\":").append(p.onGround())
+          .append(",\"in_water\":").append(p.isInWater())
+          .append(",\"using_item\":").append(p.isUsingItem())
+          .append(",\"xp_level\":").append(p.experienceLevel);
+        try {
+            StringBuilder ef = new StringBuilder();
+            for (Object e : (java.util.Collection<?>) call(p, "getActiveEffects")) {
+                if (ef.length() > 0) ef.append(';');
+                ef.append(String.valueOf(e));
+            }
+            sb.append(",\"effects\":\"").append(escape(ef.toString())).append('"');
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // нет метода
+        }
+        try {
+            StringBuilder ar = new StringBuilder();
+            AbstractContainerMenu im = p.inventoryMenu;
+            for (int i = 5; i <= 8 && i < im.getItems().size(); i++) {
+                ItemStack st = (ItemStack) im.getItems().get(i);
+                if (ar.length() > 0) ar.append(',');
+                ar.append(st.isEmpty() ? "-" : shortId(String.valueOf(BuiltInRegistries.ITEM.getKey(st.getItem()))));
+            }
+            sb.append(",\"armor\":\"").append(escape(ar.toString())).append('"');
+        } catch (RuntimeException ignored) {
+            // нет доступа к инвентарному меню
+        }
+        return sb.toString();
+    }
+
     private static String status() {
         Minecraft mc = Minecraft.getInstance();
         LocalPlayer p = mc.player;
@@ -332,6 +464,7 @@ public class AgentMod implements ClientModInitializer {
                 + ",\"health\":" + round(p.getHealth())
                 + ",\"food\":" + p.getFoodData().getFoodLevel()
                 + ",\"x\":" + round(p.getX()) + ",\"y\":" + round(p.getY()) + ",\"z\":" + round(p.getZ())
+                + statusExtra(mc, p)
                 + ",\"job\":" + jobJson() + "}";
     }
 
@@ -544,6 +677,329 @@ public class AgentMod implements ClientModInitializer {
         return "{\"ok\":true}";
     }
 
+
+    // ---------------------------------------------------------------- рефлексивные вызовы и утилиты
+
+    private static Class<?> wrapPrim(Class<?> c) {
+        if (c == boolean.class) return Boolean.class;
+        if (c == int.class) return Integer.class;
+        if (c == float.class) return Float.class;
+        if (c == double.class) return Double.class;
+        if (c == long.class) return Long.class;
+        return c;
+    }
+
+    /** Вызов метода по имени и числу аргументов (имена методов Minecraft могут отличаться между версиями). */
+    private static Object call(Object target, String name, Object... args) throws ReflectiveOperationException {
+        for (java.lang.reflect.Method m : target.getClass().getMethods()) {
+            if (!m.getName().equals(name) || m.getParameterCount() != args.length) continue;
+            Class<?>[] ps = m.getParameterTypes();
+            boolean ok = true;
+            for (int i = 0; i < ps.length; i++) {
+                if (args[i] == null) continue;
+                if (!wrapPrim(ps[i]).isAssignableFrom(args[i].getClass())) { ok = false; break; }
+            }
+            if (ok) return m.invoke(target, args);
+        }
+        throw new NoSuchMethodException(target.getClass().getName() + "." + name + "/" + args.length);
+    }
+
+    private static boolean flag(String json, String name) {
+        return json.contains("\"" + name + "\":true") || json.contains("\"" + name + "\": true");
+    }
+
+    private static Direction faceOf(String name) {
+        if (name == null) return Direction.UP;
+        return switch (name.toLowerCase(Locale.ROOT)) {
+            case "down" -> Direction.DOWN;
+            case "north" -> Direction.NORTH;
+            case "south" -> Direction.SOUTH;
+            case "east" -> Direction.EAST;
+            case "west" -> Direction.WEST;
+            default -> Direction.UP;
+        };
+    }
+
+    private static Job applyStops(Job j, String body) {
+        j.stopHealth = num(body, "stop_health");
+        j.stopHostile = num(body, "stop_hostile");
+        if (j.stopHealth <= 0) j.stopHealth = -1;
+        if (j.stopHostile <= 0) j.stopHostile = -1;
+        return j;
+    }
+
+    /** Условия остановки задачи, заданные вызывающим. null — продолжать. */
+    private static String checkStops(Minecraft mc, LocalPlayer p, Job j) {
+        if (j.stopHealth > 0 && p.getHealth() <= j.stopHealth) {
+            return "здоровье " + round(p.getHealth()) + " <= " + round(j.stopHealth);
+        }
+        if (j.stopHostile > 0 && !"attack".equals(j.type)) {
+            AABB box = p.getBoundingBox().inflate(j.stopHostile);
+            for (Monster m : mc.level.getEntitiesOfClass(Monster.class, box)) {
+                double d = Math.sqrt(p.distanceToSqr(m));
+                if (d <= j.stopHostile) {
+                    return "враждебный моб " + shortId(String.valueOf(BuiltInRegistries.ENTITY_TYPE.getKey(m.getType()))) + " в " + round(d) + " м (id " + m.getId() + ")";
+                }
+            }
+        }
+        return null;
+    }
+
+    // ---------------------------------------------------------------- события
+
+    private static final List<String> EVENTS = new ArrayList<>();
+    private static final java.util.Set<Integer> SEEN_MOBS = new java.util.HashSet<>();
+    private static float lastHealth = -1;
+    private static boolean deathReported = false;
+
+    private static void addEvent(String e) {
+        synchronized (EVENTS) {
+            if (EVENTS.size() >= 60) EVENTS.remove(0);
+            EVENTS.add(e);
+        }
+    }
+
+    /** Копит события, которые модель читает через /alerts: урон, новые враждебные мобы рядом, смерть. */
+    private static void collectEvents(Minecraft mc) {
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) return;
+        float hp = p.getHealth();
+        if (lastHealth >= 0 && hp < lastHealth - 0.01f) {
+            addEvent("урон " + round(lastHealth - hp) + ", здоровье " + round(hp));
+        }
+        lastHealth = hp;
+        if (hp <= 0 || p.isDeadOrDying()) {
+            if (!deathReported) { deathReported = true; addEvent("СМЕРТЬ: нужен /respawn"); }
+        } else {
+            deathReported = false;
+        }
+        if (mc.level.getGameTime() % 10 != 0) return;
+        AABB box = p.getBoundingBox().inflate(10);
+        java.util.Set<Integer> now = new java.util.HashSet<>();
+        for (Monster m : mc.level.getEntitiesOfClass(Monster.class, box)) {
+            now.add(m.getId());
+            if (SEEN_MOBS.add(m.getId())) {
+                addEvent("враждебный моб " + shortId(String.valueOf(BuiltInRegistries.ENTITY_TYPE.getKey(m.getType())))
+                        + " id " + m.getId() + " в " + round(Math.sqrt(p.distanceToSqr(m))) + " м");
+            }
+        }
+        SEEN_MOBS.retainAll(now);
+    }
+
+    // ---------------------------------------------------------------- сущности и действия
+
+    private static String entitiesAll(int r) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        Level level = mc.level;
+        if (p == null || level == null) return "{\"inWorld\":false}";
+        AABB box = p.getBoundingBox().inflate(r);
+        List<Entity> list = new ArrayList<>();
+        for (Entity e : level.getEntitiesOfClass(Entity.class, box)) {
+            if (e != p) list.add(e);
+        }
+        list.sort((a, b) -> Double.compare(p.distanceToSqr(a), p.distanceToSqr(b)));
+        StringBuilder sb = new StringBuilder("{\"entities\":[");
+        int n = 0;
+        for (Entity e : list) {
+            if (n >= 60) break;
+            if (n++ > 0) sb.append(',');
+            sb.append("{\"id\":").append(e.getId())
+              .append(",\"type\":\"").append(escape(shortId(String.valueOf(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()))))).append('"')
+              .append(",\"name\":\"").append(escape(e.getName().getString())).append('"')
+              .append(",\"x\":").append(round(e.getX())).append(",\"y\":").append(round(e.getY())).append(",\"z\":").append(round(e.getZ()))
+              .append(",\"distance\":").append(round(Math.sqrt(p.distanceToSqr(e))))
+              .append(",\"hostile\":").append(e instanceof Monster);
+            if (e instanceof net.minecraft.world.entity.LivingEntity le) {
+                sb.append(",\"health\":").append(round(le.getHealth())).append(",\"max_health\":").append(round(le.getMaxHealth()))
+                  .append(",\"baby\":").append(le.isBaby());
+                ItemStack held = le.getMainHandItem();
+                if (!held.isEmpty()) {
+                    sb.append(",\"holds\":\"").append(escape(shortId(String.valueOf(BuiltInRegistries.ITEM.getKey(held.getItem()))))).append('"');
+                }
+            }
+            if (e instanceof ItemEntity ie) {
+                sb.append(",\"item\":\"").append(escape(shortId(String.valueOf(BuiltInRegistries.ITEM.getKey(ie.getItem().getItem()))))).append("\",\"count\":").append(ie.getItem().getCount());
+            }
+            sb.append('}');
+        }
+        sb.append("],\"total\":").append(list.size()).append('}');
+        return sb.toString();
+    }
+
+    private static void tickAttack(Minecraft mc, LocalPlayer p, Job j) {
+        Entity e = mc.level.getEntity(j.entityId);
+        if (e == null || !e.isAlive()) {
+            j.info = "цель мертва или исчезла, ударов: " + j.hitsDone;
+            finish(j, "done", null);
+            return;
+        }
+        double dist = Math.sqrt(p.distanceToSqr(e));
+        lookAtPoint(p, e.getX(), e.getY() + e.getBbHeight() * 0.6, e.getZ());
+        if (dist > 3.0) {
+            if (!j.chase) {
+                finish(j, "failed", "цель далеко (" + round(dist) + " м), подойди или chase=true");
+                return;
+            }
+            mc.options.keyUp.setDown(true);
+            mc.options.keySprint.setDown(dist > 5);
+            BlockPos ahead = BlockPos.containing(p.getX() + Math.sin(-Math.toRadians(p.getYRot())) * 0.9, p.getY(), p.getZ() + Math.cos(Math.toRadians(p.getYRot())) * 0.9);
+            mc.options.keyJump.setDown(p.onGround() && !passable(mc.level, ahead));
+            return;
+        }
+        mc.options.keyUp.setDown(false);
+        mc.options.keySprint.setDown(false);
+        mc.options.keyJump.setDown(false);
+        if (p.getAttackStrengthScale(0.5f) >= 0.95f) {
+            try {
+                call(mc.gameMode, "attack", p, e);
+                p.swing(InteractionHand.MAIN_HAND);
+                j.hitsDone++;
+            } catch (ReflectiveOperationException | RuntimeException ex) {
+                finish(j, "failed", "атака недоступна: " + ex);
+                return;
+            }
+            if (j.hitsDone >= j.hitsWanted) {
+                j.info = "ударов: " + j.hitsDone + (e.isAlive() ? ", цель жива" : ", цель убита");
+                finish(j, "done", null);
+            }
+        }
+    }
+
+    private static void tickUse(Minecraft mc, LocalPlayer p, Job j) {
+        if (j.ticks == 0) {
+            if (j.slot >= 0 && j.slot <= 8) p.getInventory().setSelectedSlot(j.slot);
+            ItemStack held = p.getInventory().getItem(p.getInventory().getSelectedSlot());
+            if (held.isEmpty()) {
+                finish(j, "failed", "в выбранном слоте пусто");
+                return;
+            }
+            try {
+                call(mc.gameMode, "useItem", p, InteractionHand.MAIN_HAND);
+            } catch (ReflectiveOperationException | RuntimeException ex) {
+                finish(j, "failed", "использование недоступно: " + ex);
+                return;
+            }
+            j.ticks = 1;
+            if (!p.isUsingItem() && j.holdTicks == 0) {
+                finish(j, "done", null);
+            }
+            return;
+        }
+        j.ticks++;
+        boolean using = p.isUsingItem();
+        if (j.holdTicks > 0 && j.ticks > j.holdTicks) {
+            if (j.release && using) {
+                try {
+                    call(mc.gameMode, "releaseUsingItem", p);
+                } catch (ReflectiveOperationException | RuntimeException ex) {
+                    finish(j, "failed", "отпускание недоступно: " + ex);
+                    return;
+                }
+            }
+            finish(j, "done", null);
+            return;
+        }
+        if (!using && j.ticks > 3) {
+            finish(j, "done", null);
+        }
+    }
+
+    private static String interactBlock(int x, int y, int z, Direction f, boolean sneak) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) return "{\"ok\":false,\"error\":\"нет игрока\"}";
+        BlockPos pos = new BlockPos(x, y, z);
+        if (mc.level.getBlockState(pos).isAir()) return "{\"ok\":false,\"error\":\"в этой точке воздух\"}";
+        double cx = x + 0.5 + f.getStepX() * 0.5, cy = y + 0.5 + f.getStepY() * 0.5, cz = z + 0.5 + f.getStepZ() * 0.5;
+        double dist = Math.sqrt(p.distanceToSqr(cx, cy, cz));
+        if (dist > 5.0) return "{\"ok\":false,\"error\":\"слишком далеко (" + round(dist) + " м)\"}";
+        lookAtPoint(p, cx, cy, cz);
+        try {
+            BlockHitResult bhr = new BlockHitResult(new Vec3(cx, cy, cz), f, pos, false);
+            Object r = call(mc.gameMode, "useItemOn", p, InteractionHand.MAIN_HAND, bhr);
+            p.swing(InteractionHand.MAIN_HAND);
+            return "{\"ok\":true,\"result\":\"" + escape(String.valueOf(r)) + "\",\"block\":\"" + escape(shortId(blockId(mc.level.getBlockState(pos)))) + "\"}";
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return "{\"ok\":false,\"error\":\"" + escape(String.valueOf(e)) + "\"}";
+        }
+    }
+
+    private static String interactEntity(int id) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) return "{\"ok\":false,\"error\":\"нет игрока\"}";
+        Entity e = mc.level.getEntity(id);
+        if (e == null) return "{\"ok\":false,\"error\":\"нет сущности с id " + id + "\"}";
+        double dist = Math.sqrt(p.distanceToSqr(e));
+        if (dist > 4.0) return "{\"ok\":false,\"error\":\"слишком далеко (" + round(dist) + " м), подойди\"}";
+        lookAtPoint(p, e.getX(), e.getY() + e.getBbHeight() * 0.6, e.getZ());
+        try {
+            Object r = call(mc.gameMode, "interact", p, e, InteractionHand.MAIN_HAND);
+            p.swing(InteractionHand.MAIN_HAND);
+            return "{\"ok\":true,\"result\":\"" + escape(String.valueOf(r)) + "\"}";
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            return "{\"ok\":false,\"error\":\"" + escape(String.valueOf(ex)) + "\"}";
+        }
+    }
+
+    private static String blockInfo(int x, int y, int z) {
+        Minecraft mc = Minecraft.getInstance();
+        Level level = mc.level;
+        if (mc.player == null || level == null) return "{\"inWorld\":false}";
+        BlockPos pos = new BlockPos(x, y, z);
+        BlockState st = level.getBlockState(pos);
+        String raw = String.valueOf(st);
+        int b0 = raw.indexOf('[');
+        String props = (b0 >= 0 && raw.endsWith("]")) ? raw.substring(b0 + 1, raw.length() - 1) : "";
+        StringBuilder sb = new StringBuilder("{\"id\":\"" + escape(shortId(blockId(st))) + "\",\"properties\":{");
+        if (!props.isEmpty()) {
+            boolean first = true;
+            for (String kv : props.split(",")) {
+                int eq = kv.indexOf('=');
+                if (eq < 0) continue;
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('"').append(escape(kv.substring(0, eq))).append("\":\"").append(escape(kv.substring(eq + 1))).append('"');
+            }
+        }
+        sb.append("}");
+        try {
+            sb.append(",\"light\":").append(call(level, "getMaxLocalRawBrightness", pos));
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // нет метода в этой версии
+        }
+        try {
+            sb.append(",\"sky_visible\":").append(call(level, "canSeeSky", pos));
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // нет метода в этой версии
+        }
+        try {
+            sb.append(",\"hardness\":").append(call(st, "getDestroySpeed", level, pos));
+            sb.append(",\"needs_tool\":").append(call(st, "requiresCorrectToolForDrops"));
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // нет метода в этой версии
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private static String chat(String text) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || text == null || text.isEmpty()) return "{\"ok\":false}";
+        try {
+            Object conn = mc.getConnection();
+            if (text.startsWith("/")) {
+                call(conn, "sendCommand", text.substring(1));
+            } else {
+                call(conn, "sendChat", text);
+            }
+            return "{\"ok\":true}";
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return "{\"ok\":false,\"error\":\"" + escape(String.valueOf(e)) + "\"}";
+        }
+    }
+
     // ---------------------------------------------------------------- поиск пути (A*)
 
     private static boolean passable(Level level, BlockPos pos) {
@@ -587,7 +1043,8 @@ public class AgentMod implements ClientModInitializer {
             expanded++;
             double h = heuristic(cur.pos(), goal);
             if (h < closestH) { closestH = h; closest = cur; }
-            if (cur.pos().getX() == goal.getX() && cur.pos().getZ() == goal.getZ() && Math.abs(cur.pos().getY() - goal.getY()) <= 1) {
+            boolean anyY = goal.getY() < -1000;
+            if (cur.pos().getX() == goal.getX() && cur.pos().getZ() == goal.getZ() && (anyY || Math.abs(cur.pos().getY() - goal.getY()) <= 1)) {
                 return rebuild(cur);
             }
             for (int[] d : dirs) {
@@ -624,7 +1081,7 @@ public class AgentMod implements ClientModInitializer {
     }
 
     private static double heuristic(BlockPos a, BlockPos b) {
-        double dx = a.getX() - b.getX(), dz = a.getZ() - b.getZ(), dy = Math.abs(a.getY() - b.getY());
+        double dx = a.getX() - b.getX(), dz = a.getZ() - b.getZ(), dy = b.getY() < -1000 ? 0 : Math.abs(a.getY() - b.getY());
         return Math.sqrt(dx * dx + dz * dz) + dy * 0.5;
     }
 
@@ -934,7 +1391,14 @@ public class AgentMod implements ClientModInitializer {
             finish(j, "failed", "таймаут " + (j.timeoutMs / 1000) + " с");
             return;
         }
+        String stop = checkStops(mc, p, j);
+        if (stop != null) {
+            finish(j, "interrupted", stop);
+            return;
+        }
         switch (j.type) {
+            case "attack" -> tickAttack(mc, p, j);
+            case "use" -> tickUse(mc, p, j);
             case "break" -> tickBreak(mc, p, j);
             case "goto" -> tickGoto(mc, p, j);
             case "place" -> tickPlace(mc, p, j);
@@ -1134,22 +1598,46 @@ public class AgentMod implements ClientModInitializer {
     }
 
     private static void tickPlace(Minecraft mc, LocalPlayer p, Job j) {
-        // Ставим блок сверху на блок (x, y, z): смотрим на его верхнюю грань.
         BlockPos target = new BlockPos(j.x, j.y, j.z);
-        if (mc.level.getBlockState(target).isAir()) {
-            finish(j, "failed", "на этом месте нет опоры");
+        BlockPos out = target.relative(j.face);
+        if (j.placeTicks == 0) {
+            if (mc.level.getBlockState(target).isAir()) {
+                finish(j, "failed", "на этом месте нет опоры");
+                return;
+            }
+            if (!mc.level.getBlockState(out).isAir()) {
+                finish(j, "failed", "место занято: " + shortId(blockId(mc.level.getBlockState(out))));
+                return;
+            }
+            double cx = j.x + 0.5 + j.face.getStepX() * 0.5, cy = j.y + 0.5 + j.face.getStepY() * 0.5, cz = j.z + 0.5 + j.face.getStepZ() * 0.5;
+            double dist = Math.sqrt(p.distanceToSqr(cx, cy, cz));
+            if (dist > 4.5) {
+                finish(j, "failed", "блок слишком далеко (" + round(dist) + " м), сначала goto");
+                return;
+            }
+            ItemStack held = p.getInventory().getItem(p.getInventory().getSelectedSlot());
+            if (held.isEmpty()) {
+                finish(j, "failed", "в выбранном слоте пусто, выбери блок (minecraft_slot)");
+                return;
+            }
+            lookAtPoint(p, cx, cy, cz);
+            Vec3 hit = new Vec3(cx, cy, cz);
+            BlockHitResult bhr = new BlockHitResult(hit, j.face, target, false);
+            mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, bhr);
+            p.swing(InteractionHand.MAIN_HAND);
+            j.placeTicks = 1;
             return;
         }
-        double dist = Math.sqrt(p.distanceToSqr(j.x + 0.5, j.y + 1.0, j.z + 0.5));
-        if (dist > 4.5) {
-            finish(j, "failed", "блок слишком далеко, сначала /goto");
+        j.placeTicks++;
+        BlockState now = mc.level.getBlockState(out);
+        if (!now.isAir()) {
+            j.info = "поставлен " + shortId(blockId(now)) + " на (" + out.getX() + "," + out.getY() + "," + out.getZ() + ")";
+            finish(j, "done", null);
             return;
         }
-        lookAtPoint(p, j.x + 0.5, j.y + 1.0, j.z + 0.5);
-        Vec3 hit = new Vec3(j.x + 0.5, j.y + 1.0, j.z + 0.5);
-        BlockHitResult bhr = new BlockHitResult(hit, Direction.UP, target, false);
-        mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, bhr);
-        finish(j, "done", null);
+        if (j.placeTicks > 10) {
+            finish(j, "failed", "блок не поставлен (предмет не блок или нельзя ставить сюда)");
+        }
     }
 
     /** Служебный дамп API игры (имена классов и методов для крафта). Только для разработки. */
@@ -1387,7 +1875,8 @@ public class AgentMod implements ClientModInitializer {
                 if (!first) sb.append(',');
                 first = false;
                 sb.append("{\"index\":").append(rid)
-                  .append(",\"result\":\"").append(escape(String.valueOf(result))).append("\"}");
+                  .append(",\"result\":\"").append(escape(String.valueOf(result))).append("\"")
+                  .append(",\"display\":\"").append(escape(String.valueOf(display))).append("\"}");
                 idx++;
             }
             sb.append("],\"count\":").append(idx).append('}');

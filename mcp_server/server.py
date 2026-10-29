@@ -18,6 +18,61 @@ KEY_ACTIONS = ["forward", "back", "left", "right", "jump", "sneak", "sprint", "a
 
 TOOLS = [
     {
+        "name": "minecraft_entities_all",
+        "description": "Все сущности рядом (до 60, по расстоянию): id, тип, имя, координаты, расстояние, hostile, здоровье, baby, что держит; для предметов на земле item/count. id нужен для attack и interact_entity.",
+        "inputSchema": {"type": "object", "properties": {"r": {"type": "integer", "minimum": 1, "maximum": 48}}},
+    },
+    {
+        "name": "minecraft_attack",
+        "description": "Бить сущность по id до hits ударов (с учётом кулдауна). По умолчанию сам подходит (chase). Остановится, когда цель мертва. Возвращает, изменилось ли здоровье и инвентарь. Условия остановки: stop_health (<=), чтобы не умереть.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "hits": {"type": "integer", "minimum": 1, "maximum": 60}, "chase": {"type": "boolean"}}, "required": ["id"]},
+    },
+    {
+        "name": "minecraft_use_item",
+        "description": "Использовать предмет в руке (правая кнопка по воздуху): съесть еду, бросить жемчуг/глаз Эндера/снежок, вылить или набрать ведро, натянуть лук. slot (0–8) или item (сам положит в хотбар). hold_ticks — сколько держать (еда доедается сама, лук: hold_ticks≈20 и release=true). Возвращает изменения инвентаря, здоровья и голода.",
+        "inputSchema": {"type": "object", "properties": {"slot": {"type": "integer", "minimum": 0, "maximum": 8}, "item": {"type": "string"}, "hold_ticks": {"type": "integer", "minimum": 0, "maximum": 400}, "release": {"type": "boolean"}}},
+    },
+    {
+        "name": "minecraft_interact_block",
+        "description": "Правый клик по блоку с выбранной гранью (up/down/north/south/east/west): открыть дверь, сундук, печь, верстак, лечь на кровать, нажать кнопку или рычаг, вспахать землю мотыгой, посадить семена, использовать предмет на блок. Расстояние до 5 блоков. Предмет берётся из выбранного слота.",
+        "inputSchema": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}, "face": {"type": "string", "enum": ["up", "down", "north", "south", "east", "west"]}}, "required": ["x", "y", "z"]},
+    },
+    {
+        "name": "minecraft_interact_entity",
+        "description": "Правый клик по сущности по id (до 4 блоков): покормить (держи еду в руке), остричь, подоить, сесть, торговать, привязать. Возвращает изменения инвентаря.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+    },
+    {
+        "name": "minecraft_equip",
+        "description": "Экипировать предмет: броня, щит и элитры надеваются; остальное кладётся в хотбар и выбирается. Меню не должно быть открыто.",
+        "inputSchema": {"type": "object", "properties": {"item": {"type": "string"}}, "required": ["item"]},
+    },
+    {
+        "name": "minecraft_drop",
+        "description": "Выбросить предмет из инвентаря: count штук или весь стак (all=true).",
+        "inputSchema": {"type": "object", "properties": {"item": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 64}, "all": {"type": "boolean"}}, "required": ["item"]},
+    },
+    {
+        "name": "minecraft_block_info",
+        "description": "Подробности о блоке: id, свойства (age у пшеницы, open у двери, lit у печи, facing), уровень света, видно ли небо, твёрдость, нужен ли инструмент.",
+        "inputSchema": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}}, "required": ["x", "y", "z"]},
+    },
+    {
+        "name": "minecraft_alerts",
+        "description": "События с прошлого вызова: полученный урон, новые враждебные мобы рядом (с id и расстоянием), смерть. Очищается при чтении. Вызывай между действиями, чтобы вовремя заметить опасность.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "minecraft_chat",
+        "description": "Отправить сообщение в чат или команду (строка с '/'). Для отладки и аварийных случаев, например /time set day, если читы включены.",
+        "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+    },
+    {
+        "name": "minecraft_respawn",
+        "description": "Возродиться после смерти (экран смерти).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "minecraft_status",
         "description": "Диагностика: доступен ли API мода, в мире ли игрок, открытый экран/меню, измерение, текущая задача. Не падает, если игра закрыта.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -202,6 +257,20 @@ TOOLS = [
     },
 ]
 
+STOP_PROPS = {
+    "stop_health": {"type": "number", "description": "прервать задачу, если здоровье <= значения"},
+    "stop_hostile": {"type": "number", "description": "прервать задачу, если враждебный моб ближе этого расстояния"},
+}
+for _t in TOOLS:
+    if _t["name"] in ("minecraft_goto", "minecraft_break", "minecraft_place", "minecraft_attack", "minecraft_use_item"):
+        _t["inputSchema"]["properties"].update(STOP_PROPS)
+    if _t["name"] == "minecraft_place":
+        _t["inputSchema"]["properties"]["face"] = {"type": "string", "enum": ["up", "down", "north", "south", "east", "west"],
+                                                   "description": "грань опорного блока, к которой ставим (по умолчанию up)"}
+    if _t["name"] == "minecraft_goto":
+        _t["inputSchema"]["required"] = ["x", "z"]
+        _t["inputSchema"]["properties"]["y"]["description"] = "высота; если не указана, идём по любой высоте. Дальше 35 блоков идёт отрезками."
+
 
 def call_api(method, path, payload=None, timeout=8):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -240,12 +309,41 @@ def run_job(path, payload):
     return wait_job()
 
 
-def goto(x, y, z):
-    return run_job("/goto", {"x": float(x), "y": float(y), "z": float(z)})
+def stops_of(args):
+    out = {}
+    if args and args.get("stop_health"):
+        out["stop_health"] = float(args["stop_health"])
+    if args and args.get("stop_hostile"):
+        out["stop_hostile"] = float(args["stop_hostile"])
+    return out
 
 
-def brk(x, y, z):
-    return run_job("/break", {"x": int(x), "y": int(y), "z": int(z)})
+def goto(x, y, z, stops=None, any_y=False):
+    payload = {"x": float(x), "y": float(y if y is not None else 0), "z": float(z)}
+    if any_y or y is None:
+        payload["any_y"] = True
+    payload.update(stops or {})
+    return run_job("/goto", payload)
+
+
+def goto_far(x, y, z, stops=None):
+    """Длинный маршрут отрезками по 30 блоков (путь строится только по загруженным чанкам)."""
+    for _ in range(14):
+        me = api("GET", "/state")
+        dx, dz = x - me["x"], z - me["z"]
+        d = math.hypot(dx, dz)
+        if d <= 35:
+            return goto(x, y, z, stops)
+        res = goto(me["x"] + dx / d * 30, None, me["z"] + dz / d * 30, stops, any_y=True)
+        if res.get("status") != "done":
+            return res
+    return {"status": "partial", "error": "дальше 14 отрезков, повтори вызов"}
+
+
+def brk(x, y, z, stops=None):
+    payload = {"x": int(x), "y": int(y), "z": int(z)}
+    payload.update(stops or {})
+    return run_job("/break", payload)
 
 
 def inv_counts():
@@ -328,6 +426,26 @@ def collect(r=8):
 OCCLUDER = re.compile(r"\((-?\d+),(-?\d+),(-?\d+)\)")
 
 
+def brk_clear(x, y, z, log=None, stops=None):
+    """Сломать блок; если его закрывает другой блок, убрать закрывающий и повторить."""
+    res = {"status": "failed", "error": "не удалось сломать"}
+    for _ in range(4):
+        res = brk(x, y, z, stops)
+        if res.get("status") == "done":
+            return res
+        m = OCCLUDER.search(res.get("error") or "")
+        if "закрыт" in (res.get("error") or "") and m:
+            ox, oy, oz = map(int, m.groups())
+            if log is not None:
+                log.append(f"убираю мешающий блок ({ox},{oy},{oz})")
+            r2 = brk(ox, oy, oz, stops)
+            if r2.get("status") != "done":
+                return r2
+            continue
+        return res
+    return res
+
+
 def break_with_retry(t, log):
     """Сломать блок t: подойти, при необходимости убрать загораживающий блок."""
     res = goto(t["x"], t["y"], t["z"])
@@ -383,7 +501,7 @@ def dig_to(x, y, z, max_steps=60):
         if liquids:
             return {"status": "stopped", "error": "рядом жидкость: " + ",".join(liquids) + ", остановился", "notes": notes}
         for (bx, by, bz) in to_break:
-            res = brk(bx, by, bz)
+            res = brk_clear(bx, by, bz, notes)
             if res.get("status") != "done":
                 return {"status": "failed", "error": f"на шаге {step}: {res.get('error')}", "notes": notes}
         g = goto(nx, ny, nz)
@@ -610,11 +728,75 @@ def ensure_hotbar(item):
     return sel
 
 
-def place(x, y, z, item=None):
+def place(x, y, z, item=None, face="up", stops=None):
     if item:
         if ensure_hotbar(item) is None:
             return json.dumps({"status": "failed", "error": f"нет {norm_item(item)} в инвентаре"}, ensure_ascii=False)
-    return json.dumps(run_job("/place", {"x": int(x), "y": int(y), "z": int(z)}), ensure_ascii=False)
+    payload = {"x": int(x), "y": int(y), "z": int(z), "face": face or "up"}
+    payload.update(stops or {})
+    return json.dumps(run_job("/place", payload), ensure_ascii=False)
+
+
+# ------------------------------------------------------------------ наблюдение за последствиями
+
+def snapshot():
+    st = api("GET", "/state")
+    return {"inv": inv_counts(), "hp": st.get("health"), "food": st.get("food")}
+
+
+def observed(fn):
+    """Выполнить действие и вернуть результат вместе с изменениями инвентаря, здоровья и голода."""
+    before = snapshot()
+    res = fn()
+    time.sleep(0.15)
+    after = snapshot()
+    delta = {}
+    for item in set(before["inv"]) | set(after["inv"]):
+        d = after["inv"].get(item, 0) - before["inv"].get(item, 0)
+        if d:
+            delta[short(item)] = d
+    return json.dumps({"result": res, "inventory_delta": delta,
+                       "health": [before["hp"], after["hp"]], "food": [before["food"], after["food"]]}, ensure_ascii=False)
+
+
+ARMOR_SUFFIX = ("_helmet", "_chestplate", "_leggings", "_boots")
+
+
+def menu_slot_of(inv_slot):
+    return 36 + inv_slot if inv_slot < 9 else inv_slot
+
+
+def equip(item):
+    item = norm_item(item)
+    status_now = api("GET", "/status")
+    if status_now.get("menu") != "InventoryMenu":
+        return {"ok": False, "error": "открыто другое меню, закрой его (minecraft_close)"}
+    slots = api("GET", "/inventory").get("slots", [])
+    src = next((sl for sl in slots if sl["item"] == item), None)
+    if not src:
+        return {"ok": False, "error": f"нет {item} в инвентаре"}
+    n = short(item)
+    if n.endswith(ARMOR_SUFFIX) or n in ("shield", "elytra", "totem_of_undying"):
+        api("POST", "/click", {"slot": menu_slot_of(src["slot"]), "button": 0, "type": "QUICK_MOVE"})
+        st = api("GET", "/status")
+        return {"ok": True, "armor": st.get("armor")}
+    slot = ensure_hotbar(item)
+    return {"ok": slot is not None, "slot": slot}
+
+
+def drop(item, count=1, all_=False):
+    item = norm_item(item)
+    slots = api("GET", "/inventory").get("slots", [])
+    src = next((sl for sl in slots if sl["item"] == item), None)
+    if not src:
+        return {"ok": False, "error": f"нет {item} в инвентаре"}
+    ms = menu_slot_of(src["slot"])
+    if all_:
+        api("POST", "/click", {"slot": ms, "button": 1, "type": "THROW"})
+    else:
+        for _ in range(min(count, src["count"])):
+            api("POST", "/click", {"slot": ms, "button": 0, "type": "THROW"})
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ диагностика и сводка
@@ -709,11 +891,46 @@ def run_tool(name, args):
     if name == "minecraft_craft":
         return craft_item(args["item"], int(args.get("count", args.get("times", 1))))
     if name == "minecraft_goto":
-        return json.dumps(goto(float(args["x"]), float(args.get("y", 0)), float(args["z"])), ensure_ascii=False)
+        y = args.get("y")
+        return json.dumps(goto_far(float(args["x"]), None if y is None else float(y), float(args["z"]), stops_of(args)), ensure_ascii=False)
     if name == "minecraft_break":
-        return json.dumps(brk(args["x"], args["y"], args["z"]), ensure_ascii=False)
+        return json.dumps(brk(args["x"], args["y"], args["z"], stops_of(args)), ensure_ascii=False)
     if name == "minecraft_place":
-        return place(args["x"], args["y"], args["z"], args.get("item"))
+        return place(args["x"], args["y"], args["z"], args.get("item"), args.get("face", "up"), stops_of(args))
+    if name == "minecraft_entities_all":
+        return call_api("GET", f"/entities_all?r={int(args.get('r', 16))}")
+    if name == "minecraft_attack":
+        payload = {"id": int(args["id"]), "hits": int(args.get("hits", 1)), "chase": bool(args.get("chase", True))}
+        payload.update(stops_of(args))
+        return observed(lambda: run_job("/attack", payload))
+    if name == "minecraft_use_item":
+        payload = {"hold_ticks": int(args.get("hold_ticks", 0)), "release": bool(args.get("release", False))}
+        if args.get("item"):
+            slot = ensure_hotbar(args["item"])
+            if slot is None:
+                return json.dumps({"ok": False, "error": f"нет {norm_item(args['item'])} в инвентаре"}, ensure_ascii=False)
+            payload["slot"] = slot
+        elif "slot" in args:
+            payload["slot"] = int(args["slot"])
+        payload.update(stops_of(args))
+        return observed(lambda: run_job("/use_item", payload))
+    if name == "minecraft_interact_block":
+        payload = {"x": int(args["x"]), "y": int(args["y"]), "z": int(args["z"]), "face": args.get("face", "up")}
+        return observed(lambda: api("POST", "/interact_block", payload))
+    if name == "minecraft_interact_entity":
+        return observed(lambda: api("POST", "/interact_entity", {"id": int(args["id"])}))
+    if name == "minecraft_equip":
+        return json.dumps(equip(args["item"]), ensure_ascii=False)
+    if name == "minecraft_drop":
+        return json.dumps(drop(args["item"], int(args.get("count", 1)), bool(args.get("all", False))), ensure_ascii=False)
+    if name == "minecraft_block_info":
+        return call_api("GET", f"/block_info?x={int(args['x'])}&y={int(args['y'])}&z={int(args['z'])}")
+    if name == "minecraft_alerts":
+        return call_api("GET", "/alerts")
+    if name == "minecraft_chat":
+        return call_api("POST", "/chat", {"text": args["text"]})
+    if name == "minecraft_respawn":
+        return call_api("POST", "/respawn", {})
     if name == "minecraft_chop_tree":
         return chop_tree(int(args.get("radius", 12)), int(args.get("max_logs", 6)))
     if name == "minecraft_nearby":
